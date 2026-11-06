@@ -1,5 +1,8 @@
 node_modules/
 dist/
 .vitest/
+.next/
+out/
+coverage/
 *.log
 .DS_Store
