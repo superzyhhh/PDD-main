@@ -1,0 +1,220 @@
+import { createHash } from 'node:crypto';
+import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { ImageDecodeError, decodeImage, generateCandidate } from './generation';
+import { consoleLogger, type Logger } from './logger';
+import type { Moderation } from './moderation';
+import { getBasicPalette } from './palette';
+import { createSessionService, type SessionService } from './session';
+import { TaskStore } from './store';
+import type { TaskFailureCode } from './types';
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const SUPPORTED_SIZE_TIER = 'small';
+const SUPPORTED_PALETTE_TIER = 'basic';
+
+export interface ServerOptions {
+  /** 必填：内容安全校验不能有默认放行路径。 */
+  moderation: Moderation;
+  logger?: Logger;
+  session?: SessionService;
+}
+
+class BodyTooLargeError extends Error {}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    'cache-control': 'no-store',
+  });
+  res.end(payload);
+}
+
+function sendError(res: ServerResponse, status: number, code: string, message: string): void {
+  sendJson(res, status, { error: { code, message } });
+}
+
+function readBody(req: IncomingMessage, limit = MAX_UPLOAD_BYTES): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new BodyTooLargeError());
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function contentKey(buffer: Buffer, sizeTier: string, paletteTier: string): string {
+  return createHash('sha256').update(buffer).update(`|${sizeTier}|${paletteTier}`).digest('hex');
+}
+
+function failureFor(error: unknown): { code: TaskFailureCode; message: string } {
+  if (error instanceof ImageDecodeError && error.reason === 'too-large') {
+    return { code: 'image-too-large', message: '图片太大，请换一张尺寸小一些的图片' };
+  }
+  if (error instanceof ImageDecodeError) {
+    return { code: 'image-unsupported', message: '这张图片无法识别，请换一张 JPG 或 PNG 图片' };
+  }
+  return { code: 'internal', message: '生成失败，请稍后重试' };
+}
+
+export function createServer(options: ServerOptions): Server {
+  const moderation = options.moderation;
+  const logger = options.logger ?? consoleLogger;
+  const session = options.session ?? createSessionService();
+  const store = new TaskStore();
+  const palette = getBasicPalette();
+
+  async function runTask(taskId: string, image: Buffer): Promise<void> {
+    store.markProcessing(taskId);
+    try {
+      const decoded = await decodeImage(image);
+      store.complete(taskId, [generateCandidate(decoded, palette)]);
+    } catch (error) {
+      const failure = failureFor(error);
+      if (failure.code === 'internal') {
+        logger.warn('generate_failed', { taskId, error: error instanceof Error ? error.message : String(error) });
+      }
+      store.fail(taskId, failure.code, failure.message);
+    }
+  }
+
+  async function handleSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let code: unknown;
+    try {
+      const body = await readBody(req, 4096);
+      code = (JSON.parse(body.toString('utf8') || '{}') as { code?: unknown }).code;
+    } catch {
+      sendError(res, 400, 'invalid-code', '登录信息不完整，请重试');
+      return;
+    }
+    if (typeof code !== 'string' || code.length === 0) {
+      sendError(res, 400, 'invalid-code', '登录信息不完整，请重试');
+      return;
+    }
+    try {
+      const token = await session.login(code);
+      sendJson(res, 200, { token });
+    } catch (error) {
+      logger.warn('session_failed', { error: error instanceof Error ? error.message : String(error) });
+      sendError(res, 502, 'session-failed', '登录失败，请重试');
+    }
+  }
+
+  async function handleGenerate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const sizeTier = String(req.headers['x-size-tier'] ?? 'small');
+    const paletteTier = String(req.headers['x-palette-tier'] ?? 'basic');
+    if (sizeTier !== SUPPORTED_SIZE_TIER || paletteTier !== SUPPORTED_PALETTE_TIER) {
+      sendError(res, 400, 'unsupported-option', '当前版本暂不支持该尺寸或色号档位');
+      return;
+    }
+
+    let image: Buffer;
+    try {
+      image = await readBody(req);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        sendError(res, 413, 'image-too-large', '图片太大，请换一张小于 10MB 的图片');
+        return;
+      }
+      throw error;
+    }
+    if (image.length === 0) {
+      sendError(res, 400, 'empty-image', '没有收到图片，请重新上传');
+      return;
+    }
+
+    const key = contentKey(image, sizeTier, paletteTier);
+    const reusable = store.findReusable(key);
+    if (reusable) {
+      sendJson(res, 202, { taskId: reusable.id, status: reusable.status });
+      return;
+    }
+
+    let verdict: 'pass' | 'block' = 'pass';
+    try {
+      verdict = await moderation.check({
+        buffer: image,
+        contentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
+      });
+    } catch (error) {
+      // 内容安全接口异常时放行，但留痕，避免把可用性押在外部接口上。
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn('moderation_error', { error: message });
+      logger.audit('moderation_skipped', { contentKey: key, reason: message, at: new Date().toISOString() });
+    }
+
+    if (verdict === 'block') {
+      logger.audit('content_blocked', {
+        contentKey: key,
+        bytes: image.length,
+        at: new Date().toISOString(),
+      });
+      sendError(res, 422, 'content-unsafe', '这张图片不符合内容规范，请换一张图');
+      return;
+    }
+
+    // 内容安全校验是异步的，并发提交可能在此期间已经建出任务；这里再查一次，
+    // 保证同一内容的并发请求只落一个任务。
+    const concurrent = store.findReusable(key);
+    if (concurrent) {
+      sendJson(res, 202, { taskId: concurrent.id, status: concurrent.status });
+      return;
+    }
+
+    const token = String(req.headers['x-session-token'] ?? '');
+    const openId = token ? session.openIdFor(token) : undefined;
+    const task = store.create(key, openId);
+    sendJson(res, 202, { taskId: task.id, status: task.status });
+    setImmediate(() => void runTask(task.id, image));
+  }
+
+  return createHttpServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+
+    try {
+      if (req.method === 'GET' && url.pathname === '/healthz') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/session') {
+        await handleSession(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/generate') {
+        await handleGenerate(req, res);
+        return;
+      }
+
+      const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+      if (req.method === 'GET' && taskMatch) {
+        const view = store.toView(decodeURIComponent(taskMatch[1]));
+        if (!view) {
+          sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
+          return;
+        }
+        sendJson(res, 200, view);
+        return;
+      }
+
+      sendError(res, 404, 'not-found', '接口不存在');
+    } catch (error) {
+      logger.warn('request_failed', {
+        path: url.pathname,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (!res.headersSent) sendError(res, 500, 'internal', '服务异常，请稍后重试');
+    }
+  });
+}

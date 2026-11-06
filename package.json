@@ -1,0 +1,27 @@
+{
+  "name": "pindo-miniapp",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "拼豆图纸生成小程序：服务端出图 + 原生微信小程序预览",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:boundary": "npm run build && node scripts/boundary-check.mjs",
+    "ci": "npm run typecheck && npm run check:boundary && npm run test"
+  },
+  "dependencies": {
+    "sharp": "^0.34.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.0.0"
+  }
+}

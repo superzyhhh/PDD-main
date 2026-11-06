@@ -1,0 +1,110 @@
+.page {
+  padding: 24rpx 24rpx 48rpx;
+  box-sizing: border-box;
+}
+
+.header {
+  padding: 24rpx 8rpx 32rpx;
+}
+
+.title {
+  display: block;
+  font-size: 40rpx;
+  font-weight: 600;
+}
+
+.subtitle {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  color: #7A6F66;
+}
+
+.dropzone {
+  margin: 40rpx 0;
+  padding: 96rpx 32rpx;
+  border: 2rpx dashed #C9BEB2;
+  border-radius: 24rpx;
+  background: #FFFFFF;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.drop-title {
+  font-size: 32rpx;
+  font-weight: 600;
+}
+
+.drop-hint {
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  color: #9A8F85;
+}
+
+.state {
+  margin: 80rpx 0;
+  padding: 48rpx 32rpx;
+  background: #FFFFFF;
+  border-radius: 24rpx;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.state-title {
+  font-size: 30rpx;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.state-hint {
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  color: #9A8F85;
+}
+
+.summary {
+  padding: 16rpx 8rpx 24rpx;
+}
+
+.summary-main {
+  display: block;
+  font-size: 34rpx;
+  font-weight: 600;
+}
+
+.summary-sub {
+  display: block;
+  margin-top: 8rpx;
+  font-size: 24rpx;
+  color: #7A6F66;
+}
+
+.canvas-scroll {
+  width: 100%;
+  height: 900rpx;
+  background: #FFFFFF;
+  border-radius: 20rpx;
+}
+
+.pattern-canvas {
+  display: block;
+}
+
+.actions {
+  margin-top: 32rpx;
+}
+
+.btn {
+  margin-top: 24rpx;
+  border-radius: 16rpx;
+  background: #FFFFFF;
+  color: #2B2622;
+  font-size: 28rpx;
+}
+
+.btn.primary {
+  background: #2B2622;
+  color: #FFFFFF;
+}
