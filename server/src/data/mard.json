@@ -4925,16 +4925,16 @@
     "brand": "mard",
     "code": "R11",
     "name": "R11",
-    "hex": "#FFEBFB",
+    "hex": "#FFEBFA",
     "rgb": [
       255,
       235,
-      251
+      250
     ],
     "lab": [
-      95.01,
-      9.49,
-      -5.26
+      94.98,
+      9.32,
+      -4.78
     ],
     "source": "colorSystemMapping",
     "license": "community"

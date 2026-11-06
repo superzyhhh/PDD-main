@@ -6,7 +6,7 @@ import mardPalette from './data/mard.json';
  * 进阶档 291 = 基础档再加 P/Q/R/T/Y/ZG 系列（70 色）。
  * 色卡数据来源与授权见 ADR-0002：license=community，非官方授权数据。
  * 2026-11-06 对照 pindou.shanwchuan.cn/color-charts.html：291 个色号完全一致，
- * 221 档集合完全一致，290/291 个 HEX 一致；仅 R11 蓝色通道差 1（该站 #FFEBFA，本地 #FFEBFB）。
+ * 221 档集合完全一致，291 个 HEX 已全部对齐（R11 原为 #FFEBFB，已改为站点值 #FFEBFA）。
  */
 const BASIC_SERIES = /^(?:[A-H]|M)\d{2}$/;
 
