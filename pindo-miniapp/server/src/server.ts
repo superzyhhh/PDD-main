@@ -11,8 +11,10 @@ import {
   type ExportRecord,
 } from './exports';
 import { consoleLogger, type Logger } from './logger';
+import { MEMBERSHIP_PLANS, MembershipStore, PLAN_IDS, type PlanId } from './membership';
 import type { Moderation } from './moderation';
 import { getAdvancedPalette, getBasicPalette } from './palette';
+import { PaymentUnavailableError, unconfiguredPaymentProvider, type PaymentProvider } from './payment';
 import { createSessionService, type SessionService } from './session';
 import { TaskStore } from './store';
 import {
@@ -31,7 +33,11 @@ export interface ServerOptions {
   moderation: Moderation;
   logger?: Logger;
   session?: SessionService;
-  /** 291 进阶档白名单；缺省为全部拒绝。 */
+  /** 支付渠道；缺省为未配置，客户端只能看到权益、不能下单。 */
+  payment?: PaymentProvider;
+  /** 测试注入时钟；缺省用系统时间。 */
+  now?: () => Date;
+  /** 291 进阶档的额外白名单（运营/测试用）；会员资格由服务端会员状态判定。 */
   isAdvancedPaletteAllowed?: (openId?: string) => boolean;
 }
 
@@ -89,11 +95,19 @@ export function createServer(options: ServerOptions): Server {
   const session = options.session ?? createSessionService();
   const store = new TaskStore();
   const exportStore = new ExportStore();
+  const memberships = new MembershipStore();
+  const now = options.now ?? (() => new Date());
+  const payment = options.payment ?? unconfiguredPaymentProvider;
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
   const pendingExports = new Map<string, Promise<ExportRecord>>();
   const basicPalette = getBasicPalette();
   const advancedPalette = getAdvancedPalette();
-  const isAdvancedPaletteAllowed = options.isAdvancedPaletteAllowed ?? (() => false);
+  const extraAdvancedAllow = options.isAdvancedPaletteAllowed ?? (() => false);
+
+  /** 291 档位以服务端会员状态为准，额外白名单只用于运营/测试。 */
+  function isAdvancedPaletteAllowed(openId?: string): boolean {
+    return extraAdvancedAllow(openId) || memberships.isMember(openId, now());
+  }
 
   async function runTask(taskId: string, image: Buffer, sizeTier: SizeTier, paletteTier: PaletteTier): Promise<void> {
     store.markProcessing(taskId);
@@ -173,6 +187,152 @@ export function createServer(options: ServerOptions): Server {
       index: event.index,
       at: new Date().toISOString(),
     });
+    sendJson(res, 200, { ok: true });
+  }
+
+  function requestOpenId(req: IncomingMessage): string | undefined {
+    const token = String(req.headers['x-session-token'] ?? '');
+    return token ? session.openIdFor(token) : undefined;
+  }
+
+  function isIOSPlatform(req: IncomingMessage): boolean {
+    return String(req.headers['x-platform'] ?? '').toLowerCase() === 'ios';
+  }
+
+  /** 权益状态与可购买的套餐都由服务端下发；iOS 不返回任何价格。 */
+  function handleMembership(req: IncomingMessage, res: ServerResponse): void {
+    const openId = requestOpenId(req);
+    const status = openId ? memberships.statusOf(openId, now()) : undefined;
+    const purchaseAvailable = !isIOSPlatform(req) && payment.available;
+    sendJson(res, 200, {
+      purchaseAvailable,
+      plans: purchaseAvailable
+        ? PLAN_IDS.map((id) => {
+            const plan = MEMBERSHIP_PLANS[id];
+            return {
+              id: plan.id,
+              label: plan.label,
+              priceFen: plan.priceFen,
+              priceLabel: plan.priceLabel,
+              durationDays: plan.durationDays,
+            };
+          })
+        : [],
+      membership: status
+        ? {
+            active: status.active,
+            plan: status.plan,
+            expiresAt: new Date(status.expiresAt).toISOString(),
+          }
+        : null,
+    });
+  }
+
+  async function handleCreateMembershipOrder(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (isIOSPlatform(req)) {
+      sendError(res, 403, 'purchase-not-allowed', '当前设备暂不支持开通会员');
+      return;
+    }
+    const openId = requestOpenId(req);
+    if (!openId) {
+      sendError(res, 401, 'login-required', '请先登录再开通会员');
+      return;
+    }
+
+    let rawPlan: unknown;
+    try {
+      const raw = await readBody(req, 4096);
+      rawPlan = (JSON.parse(raw.toString('utf8') || '{}') as { plan?: unknown }).plan;
+    } catch {
+      sendError(res, 400, 'invalid-plan', '会员卡类型不正确');
+      return;
+    }
+    const plan =
+      typeof rawPlan === 'string' && (PLAN_IDS as readonly string[]).includes(rawPlan)
+        ? (rawPlan as PlanId)
+        : undefined;
+    if (!plan) {
+      sendError(res, 400, 'invalid-plan', '会员卡类型不正确');
+      return;
+    }
+
+    const order = memberships.createOrder(openId, plan, now());
+    let paymentParams: Record<string, unknown>;
+    try {
+      paymentParams = await payment.createPayment({
+        orderId: order.id,
+        openId,
+        plan: order.plan,
+        amountFen: order.amountFen,
+        description: `拼豆图纸会员-${MEMBERSHIP_PLANS[order.plan].label}`,
+      });
+    } catch (error) {
+      // 下单失败不留 pending 脏单，会员状态保持不变。
+      memberships.closeOrder(order.id, 'failed');
+      if (error instanceof PaymentUnavailableError) {
+        sendError(res, 503, 'payment-unavailable', '支付暂未开通，请稍后再试');
+        return;
+      }
+      throw error;
+    }
+
+    logger.audit('membership_order_created', {
+      orderId: order.id,
+      openId,
+      plan: order.plan,
+      amountFen: order.amountFen,
+      at: new Date().toISOString(),
+    });
+    sendJson(res, 200, {
+      orderId: order.id,
+      plan: order.plan,
+      amountFen: order.amountFen,
+      payment: paymentParams,
+    });
+  }
+
+  /** 支付渠道回调：只有校验通过的支付事实才能改变会员状态。 */
+  async function handlePaymentNotify(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let raw: Buffer;
+    try {
+      raw = await readBody(req, 65536);
+    } catch {
+      sendError(res, 400, 'invalid-notification', '支付通知格式不正确');
+      return;
+    }
+    const notification = await payment.parseNotification(raw, req.headers);
+    if (!notification) {
+      sendError(res, 400, 'invalid-notification', '支付通知无法校验');
+      return;
+    }
+    const order = memberships.orderOf(notification.orderId);
+    if (!order) {
+      sendError(res, 400, 'unknown-order', '订单不存在');
+      return;
+    }
+
+    if (notification.outcome === 'success') {
+      const applied = memberships.confirmPaid(
+        order.id,
+        notification.transactionId ?? '',
+        now(),
+      );
+      logger.audit(applied ? 'membership_activated' : 'membership_payment_duplicate', {
+        orderId: order.id,
+        openId: order.openId,
+        plan: order.plan,
+        transactionId: notification.transactionId,
+        at: new Date().toISOString(),
+      });
+    } else {
+      const closed = memberships.closeOrder(order.id, notification.outcome);
+      logger.audit(closed ? 'membership_order_closed' : 'membership_payment_ignored', {
+        orderId: order.id,
+        openId: order.openId,
+        status: notification.outcome,
+        at: new Date().toISOString(),
+      });
+    }
     sendJson(res, 200, { ok: true });
   }
 
@@ -256,6 +416,8 @@ export function createServer(options: ServerOptions): Server {
       sendError(res, 401, 'login-required', '请先登录再导出高清图纸');
       return;
     }
+    // 会员无限导出；非会员按上海自然日计 1 次。额度一律由服务端判定。
+    const quotaLimit = memberships.isMember(openId, now()) ? null : FREE_DAILY_EXPORT_LIMIT;
 
     let body: { taskId?: unknown; candidateId?: unknown };
     try {
@@ -295,13 +457,13 @@ export function createServer(options: ServerOptions): Server {
     const key = exportKey(openId, taskId, candidateId);
     const inFlight = pendingExports.get(key);
     if (inFlight) {
-      sendExportResult(res, await inFlight, exportStore.usedToday(openId));
+      sendExportResult(res, await inFlight, exportStore.usedToday(openId, quotaLimit, now()));
       return;
     }
 
     let decision: ReturnType<ExportStore['decide']>;
     try {
-      decision = exportStore.decide(key, openId);
+      decision = exportStore.decide(key, openId, quotaLimit, now());
     } catch (error) {
       if (error instanceof QuotaExceededError) {
         logger.audit('export_quota_exceeded', {
@@ -329,6 +491,10 @@ export function createServer(options: ServerOptions): Server {
       pendingExports.set(key, creation);
       try {
         record = await creation;
+      } catch (error) {
+        // 出图失败不占额度；会员本来就没有扣次。
+        if (quotaLimit !== null) exportStore.refund(openId, now());
+        throw error;
       } finally {
         pendingExports.delete(key);
       }
@@ -364,21 +530,15 @@ export function createServer(options: ServerOptions): Server {
     openId: string,
     input: { taskId: string; candidateId: string; candidate: Candidate },
   ): Promise<ExportRecord> {
-    try {
-      const buffer = await renderHdExport(input.candidate);
-      return exportStore.save(key, {
-        taskId: input.taskId,
-        candidateId: input.candidateId,
-        openId,
-        width: input.candidate.width,
-        height: input.candidate.height,
-        buffer,
-      });
-    } catch (error) {
-      // 出图失败不占额度。
-      exportStore.refund(openId);
-      throw error;
-    }
+    const buffer = await renderHdExport(input.candidate);
+    return exportStore.save(key, {
+      taskId: input.taskId,
+      candidateId: input.candidateId,
+      openId,
+      width: input.candidate.width,
+      height: input.candidate.height,
+      buffer,
+    });
   }
 
   function handleDownloadExport(req: IncomingMessage, res: ServerResponse, exportId: string): void {
@@ -416,6 +576,21 @@ export function createServer(options: ServerOptions): Server {
 
       if (req.method === 'POST' && url.pathname === '/api/session') {
         await handleSession(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/membership') {
+        handleMembership(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/membership/orders') {
+        await handleCreateMembershipOrder(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/membership/notify') {
+        await handlePaymentNotify(req, res);
         return;
       }
 

@@ -1,15 +1,51 @@
 <view class="page">
   <view class="header">
     <text class="title">会员权益</text>
-    <text class="subtitle">开通后立即生效；到期只收回权益，已保存的图纸仍可查看</text>
+    <text class="subtitle">到期只收回权益，已保存的图纸仍可查看</text>
   </view>
 
-  <view class="card">
-    <view class="benefit" wx:for="{{benefits}}" wx:key="*this">
-      <text class="benefit-index">{{index + 1}}</text>
-      <text class="benefit-text">{{item}}</text>
+  <view wx:if="{{loading}}" class="state">
+    <text class="state-text">正在加载会员状态…</text>
+  </view>
+
+  <view wx:elif="{{error}}" class="state">
+    <text class="state-text">{{error}}</text>
+    <button class="btn" bindtap="retryLoad">重试</button>
+  </view>
+
+  <block wx:else>
+    <view class="status-card {{membership && membership.active ? 'active' : ''}}">
+      <text class="status-title">{{membership && membership.active ? '会员生效中' : '免费账号'}}</text>
+      <text class="status-detail">{{membershipLabel}}</text>
     </view>
-  </view>
 
-  <text class="notice">会员开通即将上线</text>
+    <view class="card">
+      <view class="benefit" wx:for="{{benefits}}" wx:key="*this">
+        <text class="benefit-index">{{index + 1}}</text>
+        <text class="benefit-text">{{item}}</text>
+      </view>
+    </view>
+
+    <view wx:if="{{purchaseAvailable && !isIOS}}" class="plans">
+      <text class="plans-title">开通会员</text>
+      <view class="plan-list">
+        <view
+          wx:for="{{plans}}"
+          wx:key="id"
+          class="plan-card"
+          data-id="{{item.id}}"
+          bindtap="buy"
+        >
+          <text class="plan-label">{{item.label}}</text>
+          <text class="plan-price">{{item.priceLabel}}</text>
+          <text class="plan-days">有效期 {{item.durationDays}} 天</text>
+          <text class="plan-action">{{purchasing === item.id ? '正在拉起支付…' : '开通'}}</text>
+        </view>
+      </view>
+      <text class="notice">支付成功后权益立即生效；到期只收回权益，已保存的图纸仍可查看</text>
+    </view>
+
+    <text wx:elif="{{isIOS}}" class="notice">以上为会员权益说明</text>
+    <text wx:else class="notice">支付暂未开通，请稍后再试</text>
+  </block>
 </view>

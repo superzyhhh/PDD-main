@@ -1,4 +1,5 @@
 import { createWechatModeration, allowAllModeration } from './moderation';
+import { createSandboxPaymentProvider, unconfiguredPaymentProvider } from './payment';
 import { createServer } from './server';
 import { createSessionService } from './session';
 
@@ -20,19 +21,26 @@ if (!appId || !appSecret) {
 
 const session = createSessionService({ appId, appSecret });
 
-// 291 进阶档白名单：逗号分隔的 openId。未配置时全部拒绝（会员体系见工单 05）。
+// 支付渠道：真实微信支付需商户号、API v3 密钥与证书，配置前保持不可用；
+// 本地可用 PAYMENT_SANDBOX=1 启用沙箱，生产环境禁止。
+const sandboxPayment = process.env.PAYMENT_SANDBOX === '1';
+if (sandboxPayment && process.env.NODE_ENV === 'production') {
+  throw new Error('生产环境禁止启用 PAYMENT_SANDBOX');
+}
+const payment = sandboxPayment ? createSandboxPaymentProvider() : unconfiguredPaymentProvider;
+if (!payment.available) {
+  console.warn('[pindo-miniapp] 未配置微信支付商户参数，会员仅展示权益，暂不可开通');
+}
+
+// 291 进阶档额外白名单：逗号分隔的 openId。会员资格由服务端会员状态自动放行。
 const advancedOpenIds = (process.env.ADVANCED_PALETTE_OPENIDS ?? '')
   .split(',')
   .map((openId) => openId.trim())
   .filter(Boolean);
 
-if (advancedOpenIds.length === 0) {
-  console.warn('[pindo-miniapp] 未配置 ADVANCED_PALETTE_OPENIDS，291 进阶档将对所有账号关闭');
-}
-
 const isAdvancedPaletteAllowed = (openId?: string): boolean =>
   !!openId && advancedOpenIds.includes(openId);
 
-createServer({ moderation, session, isAdvancedPaletteAllowed }).listen(port, () => {
+createServer({ moderation, session, payment, isAdvancedPaletteAllowed }).listen(port, () => {
   console.log(`[pindo-miniapp] server listening on :${port}`);
 });

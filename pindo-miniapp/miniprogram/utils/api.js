@@ -122,6 +122,40 @@ async function downloadExport(path) {
   });
 }
 
+// 会员状态与可购套餐；权益一律以服务端返回为准，iOS 端不请求价格。
+async function getMembership(platform) {
+  const token = await ensureSession();
+  const header = { 'x-platform': platform || 'android' };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/membership`,
+    method: 'GET',
+    timeout: 10000,
+    header,
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '会员信息加载失败，请重试');
+}
+
+// 创建会员订单，返回 wx.requestPayment 所需参数；是否可开通由服务端判定。
+async function createMembershipOrder(plan, platform) {
+  const token = await ensureSession();
+  const header = {
+    'content-type': 'application/json',
+    'x-platform': platform || 'android',
+  };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/membership/orders`,
+    method: 'POST',
+    data: { plan },
+    timeout: 15000,
+    header,
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '开通失败，请稍后重试');
+}
+
 // 埋点上报为尽力而为：失败不打断主流程，但把结果交给调用方决定是否重试。
 function reportEvent(name, payload) {
   const header = { 'content-type': 'application/json' };
@@ -146,5 +180,7 @@ module.exports = {
   reportEvent,
   createExport,
   downloadExport,
+  getMembership,
+  createMembershipOrder,
   login,
 };

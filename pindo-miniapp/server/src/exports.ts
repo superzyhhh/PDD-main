@@ -32,10 +32,11 @@ export interface ExportRecord {
   createdAt: number;
 }
 
+/** limit 为 null 表示会员的无限额度，此时不计数、不拒绝。 */
 export interface QuotaSnapshot {
-  limit: number;
+  limit: number | null;
   used: number;
-  remaining: number;
+  remaining: number | null;
 }
 
 export type DecideExport =
@@ -57,11 +58,15 @@ export class ExportStore {
     return this.records.get(id);
   }
 
-  /** 先查缓存，再决定是否消耗额度；额度在出图前先扣，失败时用 refund 归还。 */
-  decide(key: string, openId: string, now = new Date()): DecideExport {
+  /**
+   * 先查缓存，再决定是否消耗额度；额度在出图前先扣，失败时用 refund 归还。
+   * limit 为 null 时代表会员无限额度，直接放行且不计数。
+   */
+  decide(key: string, openId: string, limit: number | null, now = new Date()): DecideExport {
     const cached = this.find(key);
-    if (cached) return { outcome: 'cached', record: cached, quota: this.usedToday(openId, now) };
-    return { outcome: 'allowed', quota: this.consume(openId, now) };
+    if (cached) return { outcome: 'cached', record: cached, quota: this.usedToday(openId, limit, now) };
+    if (limit === null) return { outcome: 'allowed', quota: { limit: null, used: 0, remaining: null } };
+    return { outcome: 'allowed', quota: this.consume(openId, limit, now) };
   }
 
   save(
@@ -86,24 +91,21 @@ export class ExportStore {
     entry.used -= 1;
   }
 
-  usedToday(openId: string, now = new Date()): QuotaSnapshot {
+  usedToday(openId: string, limit: number | null, now = new Date()): QuotaSnapshot {
     const entry = this.quota.get(openId);
     const used = entry && entry.day === dayKey(now) ? entry.used : 0;
-    return {
-      limit: FREE_DAILY_EXPORT_LIMIT,
-      used,
-      remaining: Math.max(0, FREE_DAILY_EXPORT_LIMIT - used),
-    };
+    if (limit === null) return { limit: null, used, remaining: null };
+    return { limit, used, remaining: Math.max(0, limit - used) };
   }
 
   /** 额度已用完时 throws，避免调用方忘记检查。 */
-  private consume(openId: string, now: Date): QuotaSnapshot {
-    if (this.usedToday(openId, now).remaining <= 0) throw new QuotaExceededError();
+  private consume(openId: string, limit: number, now: Date): QuotaSnapshot {
     const day = dayKey(now);
     const entry = this.quota.get(openId);
     const used = (entry && entry.day === day ? entry.used : 0) + 1;
+    if (used > limit) throw new QuotaExceededError();
     this.quota.set(openId, { day, used });
-    return { limit: FREE_DAILY_EXPORT_LIMIT, used, remaining: FREE_DAILY_EXPORT_LIMIT - used };
+    return { limit, used, remaining: limit - used };
   }
 
   private evictIfNeeded(): void {
