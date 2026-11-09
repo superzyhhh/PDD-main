@@ -32,6 +32,7 @@ Page({
     canvasSize: 0,
     thumbSize: 0,
     exporting: false,
+    exportingType: '',
   },
 
   onUnload() {
@@ -211,34 +212,47 @@ Page({
   },
 
   /** 导出遇到 401 时静默重新登录再试一次，登录后额度按账号继承。 */
-  async requestExport(taskId, candidateId) {
+  async requestExport(taskId, candidateId, type) {
     try {
-      return await api.createExport(taskId, candidateId);
+      return await api.createExport(taskId, candidateId, type);
     } catch (error) {
       if (error.code !== 'login-required') throw error;
       const token = await api.login();
       if (!token) throw error;
-      return api.createExport(taskId, candidateId);
+      return api.createExport(taskId, candidateId, type);
     }
   },
 
   async exportCurrent() {
+    await this.doExport('hd');
+  },
+
+  async exportTiled() {
+    await this.doExport('tiled');
+  },
+
+  async doExport(type) {
     const candidate = this.data.candidate;
     const taskId = this.data.taskId;
     if (!candidate || !taskId || this.data.exporting) return;
 
-    this.setData({ exporting: true });
+    this.setData({ exporting: true, exportingType: type });
     try {
-      const result = await this.requestExport(taskId, candidate.id);
+      const result = await this.requestExport(taskId, candidate.id, type);
       const filePath = await api.downloadExport(result.url);
-      await saveToAlbum(filePath);
-      wx.showToast({ title: '已保存到相册', icon: 'none' });
+      if (type === 'tiled') {
+        await openPdf(filePath);
+        wx.showToast({ title: '已打开分块打印图', icon: 'none' });
+      } else {
+        await saveToAlbum(filePath);
+        wx.showToast({ title: '已保存到相册', icon: 'none' });
+      }
     } catch (error) {
       if (error.code === 'quota-exceeded') this.showQuotaDialog(error.message);
       else if (error.code === 'album-denied') this.guideAlbumSetting();
       else wx.showToast({ title: error.message, icon: 'none' });
     } finally {
-      this.setData({ exporting: false });
+      this.setData({ exporting: false, exportingType: '' });
     }
   },
 
@@ -364,6 +378,19 @@ function saveToAlbum(filePath) {
           ),
         );
       },
+    });
+  });
+}
+
+/** 分块打印图是 PDF，打开后用右上角菜单保存或打印。 */
+function openPdf(filePath) {
+  return new Promise((resolve, reject) => {
+    wx.openDocument({
+      filePath,
+      fileType: 'pdf',
+      showMenu: true,
+      success: resolve,
+      fail: () => reject(new api.ApiError('无法打开打印图，请重试', 'unknown')),
     });
   });
 }

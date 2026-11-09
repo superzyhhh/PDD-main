@@ -99,11 +99,19 @@
 
       <button
         class="btn primary export-btn"
-        loading="{{exporting}}"
+        loading="{{exporting && exportingType === 'hd'}}"
         disabled="{{exporting}}"
         bindtap="exportCurrent"
       >导出高清图纸</button>
       <text class="notice">高清整图含格线与色号，保存到相册后可直接打印</text>
+
+      <button
+        class="btn export-btn"
+        loading="{{exporting && exportingType === 'tiled'}}"
+        disabled="{{exporting}}"
+        bindtap="exportTiled"
+      >导出 A4 分块打印图（{{candidate.boardCount}} 页）</button>
+      <text class="notice">按 29 格一块板分页，每页带页码、拼板编号与对齐坐标，打印后可直接照着拼</text>
     </block>
 
     <view class="actions">

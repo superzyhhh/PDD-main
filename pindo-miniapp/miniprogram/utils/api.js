@@ -90,16 +90,16 @@ async function getTask(taskId) {
   throw apiErrorFrom(response, '任务查询失败，请重新生成');
 }
 
-// 高清导出：服务端校验登录与每日额度，返回可下载资源。
-async function createExport(taskId, candidateId) {
+// 导出：服务端校验登录与每日额度，返回可下载资源；type 为 hd（PNG）或 tiled（A4 PDF）。
+async function createExport(taskId, candidateId, type = 'hd') {
   const token = await ensureSession();
   const header = { 'content-type': 'application/json' };
   if (token) header['x-session-token'] = token;
   const response = await request({
     url: `${config.BASE_URL}/api/exports`,
     method: 'POST',
-    data: { taskId, candidateId },
-    timeout: 30000,
+    data: { taskId, candidateId, type },
+    timeout: 60000,
     header,
   });
   if (response.statusCode === 200) return response.data;

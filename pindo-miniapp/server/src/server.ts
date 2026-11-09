@@ -8,6 +8,7 @@ import {
   QuotaExceededError,
   exportKey,
   renderHdExport,
+  type ExportFormat,
   type ExportRecord,
 } from './exports';
 import { consoleLogger, type Logger } from './logger';
@@ -15,6 +16,7 @@ import { MEMBERSHIP_PLANS, MembershipStore, PLAN_IDS, type PlanId } from './memb
 import type { Moderation } from './moderation';
 import { getAdvancedPalette, getBasicPalette } from './palette';
 import { PaymentUnavailableError, unconfiguredPaymentProvider, type PaymentProvider } from './payment';
+import { renderTiledPrintExport } from './print';
 import { createSessionService, type SessionService } from './session';
 import { TaskStore } from './store';
 import {
@@ -419,17 +421,27 @@ export function createServer(options: ServerOptions): Server {
     // 会员无限导出；非会员按上海自然日计 1 次。额度一律由服务端判定。
     const quotaLimit = memberships.isMember(openId, now()) ? null : FREE_DAILY_EXPORT_LIMIT;
 
-    let body: { taskId?: unknown; candidateId?: unknown };
+    let body: { taskId?: unknown; candidateId?: unknown; type?: unknown };
     try {
       const raw = await readBody(req, 4096);
-      body = JSON.parse(raw.toString('utf8') || '{}') as { taskId?: unknown; candidateId?: unknown };
+      body = JSON.parse(raw.toString('utf8') || '{}') as {
+        taskId?: unknown;
+        candidateId?: unknown;
+        type?: unknown;
+      };
     } catch {
       sendError(res, 400, 'invalid-export', '导出参数不正确');
       return;
     }
     const taskId = typeof body.taskId === 'string' ? body.taskId : '';
     const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
-    if (!taskId || !candidateId) {
+    const format: ExportFormat | undefined =
+      body.type === undefined || body.type === 'hd'
+        ? 'hd'
+        : body.type === 'tiled'
+          ? 'tiled'
+          : undefined;
+    if (!taskId || !candidateId || !format) {
       sendError(res, 400, 'invalid-export', '导出参数不正确');
       return;
     }
@@ -454,7 +466,7 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const key = exportKey(openId, taskId, candidateId);
+    const key = exportKey(openId, taskId, candidateId, format);
     const inFlight = pendingExports.get(key);
     if (inFlight) {
       sendExportResult(res, await inFlight, exportStore.usedToday(openId, quotaLimit, now()));
@@ -487,7 +499,7 @@ export function createServer(options: ServerOptions): Server {
     if (decision.outcome === 'cached') {
       record = decision.record;
     } else {
-      const creation = createExportRecord(key, openId, { taskId, candidateId, candidate });
+      const creation = createExportRecord(key, openId, { taskId, candidateId, candidate, format });
       pendingExports.set(key, creation);
       try {
         record = await creation;
@@ -513,12 +525,15 @@ export function createServer(options: ServerOptions): Server {
   }
 
   function sendExportResult(res: ServerResponse, record: ExportRecord, quota: unknown): void {
+    const suffix = record.format === 'tiled' ? 'pdf' : 'png';
     sendJson(res, 200, {
       exportId: record.id,
-      url: `/api/exports/${record.id}.png`,
+      url: `/api/exports/${record.id}.${suffix}`,
       taskId: record.taskId,
       candidateId: record.candidateId,
-      type: 'hd',
+      type: record.format,
+      format: suffix,
+      pageCount: record.pageCount,
       width: record.width,
       height: record.height,
       quota,
@@ -528,20 +543,39 @@ export function createServer(options: ServerOptions): Server {
   async function createExportRecord(
     key: string,
     openId: string,
-    input: { taskId: string; candidateId: string; candidate: Candidate },
+    input: { taskId: string; candidateId: string; candidate: Candidate; format: ExportFormat },
   ): Promise<ExportRecord> {
+    if (input.format === 'tiled') {
+      const { pdf, pageCount } = await renderTiledPrintExport(input.candidate);
+      return exportStore.save(key, {
+        taskId: input.taskId,
+        candidateId: input.candidateId,
+        openId,
+        format: 'tiled',
+        pageCount,
+        width: input.candidate.width,
+        height: input.candidate.height,
+        buffer: pdf,
+      });
+    }
     const buffer = await renderHdExport(input.candidate);
     return exportStore.save(key, {
       taskId: input.taskId,
       candidateId: input.candidateId,
       openId,
+      format: 'hd',
       width: input.candidate.width,
       height: input.candidate.height,
       buffer,
     });
   }
 
-  function handleDownloadExport(req: IncomingMessage, res: ServerResponse, exportId: string): void {
+  function handleDownloadExport(
+    req: IncomingMessage,
+    res: ServerResponse,
+    exportId: string,
+    suffix: string,
+  ): void {
     const token = String(req.headers['x-session-token'] ?? '');
     const openId = token ? session.openIdFor(token) : undefined;
     if (!openId) {
@@ -549,7 +583,7 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
     const record = exportStore.get(exportId);
-    if (!record) {
+    if (!record || record.format !== (suffix === 'pdf' ? 'tiled' : 'hd')) {
       sendError(res, 404, 'export-not-found', '导出资源不存在，请重新导出');
       return;
     }
@@ -558,7 +592,7 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
     res.writeHead(200, {
-      'content-type': 'image/png',
+      'content-type': record.format === 'tiled' ? 'application/pdf' : 'image/png',
       'content-length': record.buffer.length,
       'cache-control': 'no-store',
     });
@@ -609,9 +643,9 @@ export function createServer(options: ServerOptions): Server {
         return;
       }
 
-      const exportMatch = url.pathname.match(/^\/api\/exports\/([^/]+)\.png$/);
+      const exportMatch = url.pathname.match(/^\/api\/exports\/([^/]+)\.(png|pdf)$/);
       if (req.method === 'GET' && exportMatch) {
-        handleDownloadExport(req, res, exportMatch[1]);
+        handleDownloadExport(req, res, exportMatch[1], exportMatch[2]);
         return;
       }
 

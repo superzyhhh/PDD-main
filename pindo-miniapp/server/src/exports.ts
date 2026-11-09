@@ -15,9 +15,17 @@ function dayKey(now: Date): string {
   return new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
-export function exportKey(openId: string, taskId: string, candidateId: string): string {
-  return `${openId}|${taskId}|${candidateId}|hd`;
+export function exportKey(
+  openId: string,
+  taskId: string,
+  candidateId: string,
+  format: ExportFormat = 'hd',
+): string {
+  return `${openId}|${taskId}|${candidateId}|${format}`;
 }
+
+/** 导出类型：高清整图 PNG，或按 A4 分块打印的 PDF。 */
+export type ExportFormat = 'hd' | 'tiled';
 
 export interface ExportRecord {
   id: string;
@@ -25,6 +33,9 @@ export interface ExportRecord {
   taskId: string;
   candidateId: string;
   openId: string;
+  format: ExportFormat;
+  /** 分块打印的页数，等于拼板数；高清整图不填。 */
+  pageCount?: number;
   /** 格网尺寸（格），不是像素。 */
   width: number;
   height: number;
@@ -138,14 +149,8 @@ export async function renderHdExport(candidate: Candidate): Promise<Buffer> {
     for (let x = 0; x < candidate.width; x++) {
       const code = candidate.grid[y][x];
       const hex = hexByCode.get(code) ?? '#FFFFFF';
-      const px = x * cell;
-      const py = y * cell;
       parts.push(
-        `<rect x="${px}" y="${py}" width="${cell}" height="${cell}" fill="${hex}" stroke="#D9D3CB" stroke-width="1"/>`,
-      );
-      parts.push(
-        `<text x="${px + cell / 2}" y="${py + cell / 2 + fontSize * 0.35}" font-family="sans-serif" ` +
-          `font-size="${fontSize}" text-anchor="middle" fill="${textColor(hex)}">${code}</text>`,
+        gridCellSvg(x * cell, y * cell, cell, code, hex, fontSize),
       );
     }
   }
@@ -172,10 +177,28 @@ export async function renderHdExport(candidate: Candidate): Promise<Buffer> {
 }
 
 /** 浅色底用深字，深色底用白字，与预览端一致。 */
-function textColor(hex: string): string {
+export function textColor(hex: string): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
   const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
   return luminance > 150 ? '#2B2622' : '#FFFFFF';
+}
+
+/** 一个格子的底色、格线与色号；高清整图与分块打印共用同一套格子渲染。 */
+export function gridCellSvg(
+  px: number,
+  py: number,
+  cell: number,
+  code: string,
+  hex: string,
+  fontSize: number,
+  strokeWidth = 1,
+): string {
+  return (
+    `<rect x="${px}" y="${py}" width="${cell}" height="${cell}" fill="${hex}" ` +
+    `stroke="#D9D3CB" stroke-width="${strokeWidth}"/>` +
+    `<text x="${px + cell / 2}" y="${py + cell / 2 + fontSize * 0.35}" font-family="sans-serif" ` +
+    `font-size="${fontSize}" text-anchor="middle" fill="${textColor(hex)}">${code}</text>`
+  );
 }
