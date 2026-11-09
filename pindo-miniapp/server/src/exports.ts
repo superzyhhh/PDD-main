@@ -1,0 +1,179 @@
+import { randomUUID } from 'node:crypto';
+import sharp from 'sharp';
+import type { Candidate } from './types';
+
+/** 高清导出的单格像素：40px，保证格线与色号可直接打印。 */
+export const HD_CELL_PX = 40;
+
+/** 免费账号每日高清导出次数。 */
+export const FREE_DAILY_EXPORT_LIMIT = 1;
+
+const MAX_EXPORTS = 20;
+
+/** 额度按上海时区的自然日结算。 */
+function dayKey(now: Date): string {
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+export function exportKey(openId: string, taskId: string, candidateId: string): string {
+  return `${openId}|${taskId}|${candidateId}|hd`;
+}
+
+export interface ExportRecord {
+  id: string;
+  key: string;
+  taskId: string;
+  candidateId: string;
+  openId: string;
+  /** 格网尺寸（格），不是像素。 */
+  width: number;
+  height: number;
+  buffer: Buffer;
+  createdAt: number;
+}
+
+export interface QuotaSnapshot {
+  limit: number;
+  used: number;
+  remaining: number;
+}
+
+export type DecideExport =
+  | { outcome: 'cached'; record: ExportRecord; quota: QuotaSnapshot }
+  | { outcome: 'allowed'; quota: QuotaSnapshot };
+
+/** 导出缓存 + 按 openId 的每日额度；缓存命中不扣次。 */
+export class ExportStore {
+  private readonly records = new Map<string, ExportRecord>();
+  private readonly byKey = new Map<string, string>();
+  private readonly quota = new Map<string, { day: string; used: number }>();
+
+  find(key: string): ExportRecord | undefined {
+    const id = this.byKey.get(key);
+    return id ? this.records.get(id) : undefined;
+  }
+
+  get(id: string): ExportRecord | undefined {
+    return this.records.get(id);
+  }
+
+  /** 先查缓存，再决定是否消耗额度；额度在出图前先扣，失败时用 refund 归还。 */
+  decide(key: string, openId: string, now = new Date()): DecideExport {
+    const cached = this.find(key);
+    if (cached) return { outcome: 'cached', record: cached, quota: this.usedToday(openId, now) };
+    return { outcome: 'allowed', quota: this.consume(openId, now) };
+  }
+
+  save(
+    key: string,
+    input: Omit<ExportRecord, 'id' | 'key' | 'createdAt'>,
+  ): ExportRecord {
+    const record: ExportRecord = {
+      ...input,
+      id: randomUUID(),
+      key,
+      createdAt: Date.now(),
+    };
+    this.records.set(record.id, record);
+    this.byKey.set(key, record.id);
+    this.evictIfNeeded();
+    return record;
+  }
+
+  refund(openId: string, now = new Date()): void {
+    const entry = this.quota.get(openId);
+    if (!entry || entry.day !== dayKey(now) || entry.used === 0) return;
+    entry.used -= 1;
+  }
+
+  usedToday(openId: string, now = new Date()): QuotaSnapshot {
+    const entry = this.quota.get(openId);
+    const used = entry && entry.day === dayKey(now) ? entry.used : 0;
+    return {
+      limit: FREE_DAILY_EXPORT_LIMIT,
+      used,
+      remaining: Math.max(0, FREE_DAILY_EXPORT_LIMIT - used),
+    };
+  }
+
+  /** 额度已用完时 throws，避免调用方忘记检查。 */
+  private consume(openId: string, now: Date): QuotaSnapshot {
+    if (this.usedToday(openId, now).remaining <= 0) throw new QuotaExceededError();
+    const day = dayKey(now);
+    const entry = this.quota.get(openId);
+    const used = (entry && entry.day === day ? entry.used : 0) + 1;
+    this.quota.set(openId, { day, used });
+    return { limit: FREE_DAILY_EXPORT_LIMIT, used, remaining: FREE_DAILY_EXPORT_LIMIT - used };
+  }
+
+  private evictIfNeeded(): void {
+    if (this.records.size <= MAX_EXPORTS) return;
+    const oldest = [...this.records.values()].sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (!oldest) return;
+    this.records.delete(oldest.id);
+    if (this.byKey.get(oldest.key) === oldest.id) this.byKey.delete(oldest.key);
+  }
+}
+
+export class QuotaExceededError extends Error {}
+
+/**
+ * 把候选渲染成高清整图：每格填色、画格线与色号，每 29 格加粗拼板分界线。
+ * 纯色块 + ASCII 色号，SVG 交给 sharp 栅格化，不带任何水印。
+ */
+export async function renderHdExport(candidate: Candidate): Promise<Buffer> {
+  const cell = HD_CELL_PX;
+  const pixelWidth = candidate.width * cell;
+  const pixelHeight = candidate.height * cell;
+  const fontSize = Math.round(cell * 0.32);
+
+  const hexByCode = new Map(candidate.colors.map((color) => [color.code, color.hex]));
+  const parts: string[] = [
+    `<rect x="0" y="0" width="${pixelWidth}" height="${pixelHeight}" fill="#FFFFFF"/>`,
+  ];
+
+  for (let y = 0; y < candidate.height; y++) {
+    for (let x = 0; x < candidate.width; x++) {
+      const code = candidate.grid[y][x];
+      const hex = hexByCode.get(code) ?? '#FFFFFF';
+      const px = x * cell;
+      const py = y * cell;
+      parts.push(
+        `<rect x="${px}" y="${py}" width="${cell}" height="${cell}" fill="${hex}" stroke="#D9D3CB" stroke-width="1"/>`,
+      );
+      parts.push(
+        `<text x="${px + cell / 2}" y="${py + cell / 2 + fontSize * 0.35}" font-family="sans-serif" ` +
+          `font-size="${fontSize}" text-anchor="middle" fill="${textColor(hex)}">${code}</text>`,
+      );
+    }
+  }
+
+  // 拼板分界线：每 29 格一条，便于按板裁切。
+  for (let x = 29; x < candidate.width; x += 29) {
+    parts.push(`<line x1="${x * cell}" y1="0" x2="${x * cell}" y2="${pixelHeight}" stroke="#2B2622" stroke-width="3"/>`);
+  }
+  for (let y = 29; y < candidate.height; y += 29) {
+    parts.push(`<line x1="0" y1="${y * cell}" x2="${pixelWidth}" y2="${y * cell}" stroke="#2B2622" stroke-width="3"/>`);
+  }
+  parts.push(
+    `<rect x="1.5" y="1.5" width="${pixelWidth - 3}" height="${pixelHeight - 3}" fill="none" stroke="#2B2622" stroke-width="3"/>`,
+  );
+
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${pixelWidth}" height="${pixelHeight}" ` +
+    `viewBox="0 0 ${pixelWidth} ${pixelHeight}">${parts.join('')}</svg>`;
+
+  return sharp(Buffer.from(svg))
+    .flatten({ background: '#FFFFFF' })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
+/** 浅色底用深字，深色底用白字，与预览端一致。 */
+function textColor(hex: string): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return luminance > 150 ? '#2B2622' : '#FFFFFF';
+}

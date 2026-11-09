@@ -1,0 +1,65 @@
+.page {
+  padding: 24rpx 24rpx 48rpx;
+  box-sizing: border-box;
+}
+
+.header {
+  padding: 24rpx 8rpx 32rpx;
+}
+
+.title {
+  display: block;
+  font-size: 40rpx;
+  font-weight: 600;
+}
+
+.subtitle {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  line-height: 1.5;
+  color: #7A6F66;
+}
+
+.card {
+  padding: 8rpx 24rpx;
+  background: #FFFFFF;
+  border-radius: 20rpx;
+}
+
+.benefit {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 28rpx 0;
+  border-bottom: 2rpx solid #F0EBE4;
+}
+
+.benefit:last-child {
+  border-bottom: none;
+}
+
+.benefit-index {
+  width: 44rpx;
+  height: 44rpx;
+  border-radius: 999rpx;
+  background: #2B2622;
+  color: #FFFFFF;
+  font-size: 22rpx;
+  line-height: 44rpx;
+  text-align: center;
+}
+
+.benefit-text {
+  margin-left: 20rpx;
+  font-size: 28rpx;
+  color: #2B2622;
+}
+
+.notice {
+  display: block;
+  margin-top: 24rpx;
+  padding: 0 8rpx;
+  font-size: 22rpx;
+  color: #9A8F85;
+}

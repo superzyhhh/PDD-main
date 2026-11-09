@@ -31,6 +31,7 @@ Page({
     candidate: null,
     canvasSize: 0,
     thumbSize: 0,
+    exporting: false,
   },
 
   onUnload() {
@@ -209,6 +210,71 @@ Page({
     });
   },
 
+  /** 导出遇到 401 时静默重新登录再试一次，登录后额度按账号继承。 */
+  async requestExport(taskId, candidateId) {
+    try {
+      return await api.createExport(taskId, candidateId);
+    } catch (error) {
+      if (error.code !== 'login-required') throw error;
+      const token = await api.login();
+      if (!token) throw error;
+      return api.createExport(taskId, candidateId);
+    }
+  },
+
+  async exportCurrent() {
+    const candidate = this.data.candidate;
+    const taskId = this.data.taskId;
+    if (!candidate || !taskId || this.data.exporting) return;
+
+    this.setData({ exporting: true });
+    try {
+      const result = await this.requestExport(taskId, candidate.id);
+      const filePath = await api.downloadExport(result.url);
+      await saveToAlbum(filePath);
+      wx.showToast({ title: '已保存到相册', icon: 'none' });
+    } catch (error) {
+      if (error.code === 'quota-exceeded') this.showQuotaDialog(error.message);
+      else if (error.code === 'album-denied') this.guideAlbumSetting();
+      else wx.showToast({ title: error.message, icon: 'none' });
+    } finally {
+      this.setData({ exporting: false });
+    }
+  },
+
+  showQuotaDialog(message) {
+    if (isIOS()) {
+      // ADR-0003：iOS 不出现购买入口或虚拟商品文案。
+      wx.showModal({
+        title: '今日免费导出已用完',
+        content: '明天再来，或先继续预览其他图纸',
+        showCancel: false,
+        confirmText: '知道了',
+      });
+      return;
+    }
+    wx.showModal({
+      title: '今日免费导出已用完',
+      content: message,
+      cancelText: '知道了',
+      confirmText: '会员权益',
+      success: (res) => {
+        if (res.confirm) wx.navigateTo({ url: '/pages/membership/membership' });
+      },
+    });
+  },
+
+  guideAlbumSetting() {
+    wx.showModal({
+      title: '需要相册权限',
+      content: '请在设置中允许保存图片到相册',
+      confirmText: '去设置',
+      success: (res) => {
+        if (res.confirm) wx.openSetting();
+      },
+    });
+  },
+
   paint(selector, candidate, cell, showCodes) {
     wx.createSelectorQuery()
       .in(this)
@@ -282,4 +348,31 @@ function detailCell(candidate) {
   const rpx = (info.windowWidth || 375) / 750;
   const availableWidth = Math.max(1, Math.floor(info.windowWidth - PAGE_H_PADDING_RPX * rpx));
   return Math.max(1, Math.floor(availableWidth / candidate.width));
+}
+
+function saveToAlbum(filePath) {
+  return new Promise((resolve, reject) => {
+    wx.saveImageToPhotosAlbum({
+      filePath,
+      success: resolve,
+      fail: (err) => {
+        const denied = /auth|deny|permission/i.test((err && err.errMsg) || '');
+        reject(
+          new api.ApiError(
+            denied ? '需要相册权限才能保存图纸' : '保存失败，请重试',
+            denied ? 'album-denied' : 'unknown',
+          ),
+        );
+      },
+    });
+  });
+}
+
+function isIOS() {
+  try {
+    const info = wx.getDeviceInfo ? wx.getDeviceInfo() : wx.getSystemInfoSync();
+    return info.platform === 'ios';
+  } catch {
+    return false;
+  }
 }

@@ -1,5 +1,5 @@
 {
-  "pages": ["pages/index/index"],
+  "pages": ["pages/index/index", "pages/membership/membership"],
   "window": {
     "navigationBarTitleText": "拼豆图纸",
     "navigationBarBackgroundColor": "#FFFFFF",

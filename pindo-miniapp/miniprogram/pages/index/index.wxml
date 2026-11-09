@@ -96,6 +96,14 @@
           style="width: {{canvasSize}}px; height: {{canvasSize}}px;"
         ></canvas>
       </scroll-view>
+
+      <button
+        class="btn primary export-btn"
+        loading="{{exporting}}"
+        disabled="{{exporting}}"
+        bindtap="exportCurrent"
+      >导出高清图纸</button>
+      <text class="notice">高清整图含格线与色号，保存到相册后可直接打印</text>
     </block>
 
     <view class="actions">

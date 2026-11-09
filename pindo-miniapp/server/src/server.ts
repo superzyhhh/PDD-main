@@ -2,6 +2,14 @@ import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { parseAnalyticsEvent } from './analytics';
 import { ImageDecodeError, decodeImage, generateCandidates } from './generation';
+import {
+  ExportStore,
+  FREE_DAILY_EXPORT_LIMIT,
+  QuotaExceededError,
+  exportKey,
+  renderHdExport,
+  type ExportRecord,
+} from './exports';
 import { consoleLogger, type Logger } from './logger';
 import type { Moderation } from './moderation';
 import { getAdvancedPalette, getBasicPalette } from './palette';
@@ -10,6 +18,7 @@ import { TaskStore } from './store';
 import {
   PALETTE_TIERS,
   SIZE_TIERS,
+  type Candidate,
   type PaletteTier,
   type SizeTier,
   type TaskFailureCode,
@@ -79,6 +88,9 @@ export function createServer(options: ServerOptions): Server {
   const logger = options.logger ?? consoleLogger;
   const session = options.session ?? createSessionService();
   const store = new TaskStore();
+  const exportStore = new ExportStore();
+  /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
+  const pendingExports = new Map<string, Promise<ExportRecord>>();
   const basicPalette = getBasicPalette();
   const advancedPalette = getAdvancedPalette();
   const isAdvancedPaletteAllowed = options.isAdvancedPaletteAllowed ?? (() => false);
@@ -237,6 +249,162 @@ export function createServer(options: ServerOptions): Server {
     setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier));
   }
 
+  async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const token = String(req.headers['x-session-token'] ?? '');
+    const openId = token ? session.openIdFor(token) : undefined;
+    if (!openId) {
+      sendError(res, 401, 'login-required', '请先登录再导出高清图纸');
+      return;
+    }
+
+    let body: { taskId?: unknown; candidateId?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as { taskId?: unknown; candidateId?: unknown };
+    } catch {
+      sendError(res, 400, 'invalid-export', '导出参数不正确');
+      return;
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    if (!taskId || !candidateId) {
+      sendError(res, 400, 'invalid-export', '导出参数不正确');
+      return;
+    }
+
+    const view = store.toView(taskId);
+    if (!view) {
+      sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
+      return;
+    }
+    if (view.status !== 'completed') {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再导出');
+      return;
+    }
+    const candidate = view.candidates?.find((item) => item.id === candidateId);
+    if (!candidate) {
+      sendError(res, 400, 'invalid-export', '没有找到这张候选图纸');
+      return;
+    }
+    const owner = store.ownerOf(taskId);
+    if (owner && owner !== openId) {
+      sendError(res, 403, 'export-forbidden', '无权导出该图纸');
+      return;
+    }
+
+    const key = exportKey(openId, taskId, candidateId);
+    const inFlight = pendingExports.get(key);
+    if (inFlight) {
+      sendExportResult(res, await inFlight, exportStore.usedToday(openId));
+      return;
+    }
+
+    let decision: ReturnType<ExportStore['decide']>;
+    try {
+      decision = exportStore.decide(key, openId);
+    } catch (error) {
+      if (error instanceof QuotaExceededError) {
+        logger.audit('export_quota_exceeded', {
+          taskId,
+          candidateId,
+          openId,
+          at: new Date().toISOString(),
+        });
+        sendError(
+          res,
+          429,
+          'quota-exceeded',
+          `今日 ${FREE_DAILY_EXPORT_LIMIT} 次免费导出已用完，开通会员可无限导出`,
+        );
+        return;
+      }
+      throw error;
+    }
+
+    let record: ExportRecord;
+    if (decision.outcome === 'cached') {
+      record = decision.record;
+    } else {
+      const creation = createExportRecord(key, openId, { taskId, candidateId, candidate });
+      pendingExports.set(key, creation);
+      try {
+        record = await creation;
+      } finally {
+        pendingExports.delete(key);
+      }
+    }
+
+    logger.audit(decision.outcome === 'cached' ? 'export_cache_hit' : 'export_created', {
+      exportId: record.id,
+      taskId,
+      candidateId,
+      openId,
+      width: record.width,
+      height: record.height,
+      at: new Date().toISOString(),
+    });
+    sendExportResult(res, record, decision.quota);
+  }
+
+  function sendExportResult(res: ServerResponse, record: ExportRecord, quota: unknown): void {
+    sendJson(res, 200, {
+      exportId: record.id,
+      url: `/api/exports/${record.id}.png`,
+      taskId: record.taskId,
+      candidateId: record.candidateId,
+      type: 'hd',
+      width: record.width,
+      height: record.height,
+      quota,
+    });
+  }
+
+  async function createExportRecord(
+    key: string,
+    openId: string,
+    input: { taskId: string; candidateId: string; candidate: Candidate },
+  ): Promise<ExportRecord> {
+    try {
+      const buffer = await renderHdExport(input.candidate);
+      return exportStore.save(key, {
+        taskId: input.taskId,
+        candidateId: input.candidateId,
+        openId,
+        width: input.candidate.width,
+        height: input.candidate.height,
+        buffer,
+      });
+    } catch (error) {
+      // 出图失败不占额度。
+      exportStore.refund(openId);
+      throw error;
+    }
+  }
+
+  function handleDownloadExport(req: IncomingMessage, res: ServerResponse, exportId: string): void {
+    const token = String(req.headers['x-session-token'] ?? '');
+    const openId = token ? session.openIdFor(token) : undefined;
+    if (!openId) {
+      sendError(res, 401, 'login-required', '请先登录再下载图纸');
+      return;
+    }
+    const record = exportStore.get(exportId);
+    if (!record) {
+      sendError(res, 404, 'export-not-found', '导出资源不存在，请重新导出');
+      return;
+    }
+    if (record.openId !== openId) {
+      sendError(res, 403, 'export-forbidden', '无权下载该图纸');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': record.buffer.length,
+      'cache-control': 'no-store',
+    });
+    res.end(record.buffer);
+  }
+
   return createHttpServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
 
@@ -258,6 +426,17 @@ export function createServer(options: ServerOptions): Server {
 
       if (req.method === 'POST' && url.pathname === '/api/events') {
         await handleEvent(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/exports') {
+        await handleCreateExport(req, res);
+        return;
+      }
+
+      const exportMatch = url.pathname.match(/^\/api\/exports\/([^/]+)\.png$/);
+      if (req.method === 'GET' && exportMatch) {
+        handleDownloadExport(req, res, exportMatch[1]);
         return;
       }
 

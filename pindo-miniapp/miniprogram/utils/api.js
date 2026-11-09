@@ -53,6 +53,12 @@ async function ensureSession() {
   return sessionToken;
 }
 
+// 强制重新登录，用于导出遇到 401 后重新引导。
+async function login() {
+  sessionToken = '';
+  return ensureSession();
+}
+
 async function generate(arrayBuffer, options = {}) {
   const token = await ensureSession();
   const header = {
@@ -84,6 +90,38 @@ async function getTask(taskId) {
   throw apiErrorFrom(response, '任务查询失败，请重新生成');
 }
 
+// 高清导出：服务端校验登录与每日额度，返回可下载资源。
+async function createExport(taskId, candidateId) {
+  const token = await ensureSession();
+  const header = { 'content-type': 'application/json' };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/exports`,
+    method: 'POST',
+    data: { taskId, candidateId },
+    timeout: 30000,
+    header,
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '导出失败，请稍后重试');
+}
+
+// 下载已生成的导出资源；服务端要求登录且只能取本账号的资源。
+async function downloadExport(path) {
+  const token = await ensureSession();
+  return new Promise((resolve, reject) => {
+    wx.downloadFile({
+      url: `${config.BASE_URL}${path}`,
+      header: token ? { 'x-session-token': token } : {},
+      success: (res) => {
+        if (res.statusCode === 200) resolve(res.tempFilePath);
+        else reject(new ApiError('图纸下载失败，请重试', 'network'));
+      },
+      fail: () => reject(new ApiError('网络连接失败，请检查网络后重试', 'network')),
+    });
+  });
+}
+
 // 埋点上报为尽力而为：失败不打断主流程，但把结果交给调用方决定是否重试。
 function reportEvent(name, payload) {
   const header = { 'content-type': 'application/json' };
@@ -101,4 +139,12 @@ function reportEvent(name, payload) {
   });
 }
 
-module.exports = { ApiError, generate, getTask, reportEvent };
+module.exports = {
+  ApiError,
+  generate,
+  getTask,
+  reportEvent,
+  createExport,
+  downloadExport,
+  login,
+};
