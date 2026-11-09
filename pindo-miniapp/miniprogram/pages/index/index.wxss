@@ -50,6 +50,67 @@
   flex-direction: row;
 }
 
+.chips.wrap {
+  flex-wrap: wrap;
+}
+
+.chips.wrap .chip {
+  margin-bottom: 16rpx;
+}
+
+.advanced {
+  margin: 0 8rpx 24rpx;
+  padding: 20rpx 20rpx 8rpx;
+  background: #FFFFFF;
+  border: 2rpx solid #E6DED4;
+  border-radius: 16rpx;
+}
+
+.advanced-toggle {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.advanced-title {
+  font-size: 26rpx;
+  color: #7A6F66;
+}
+
+.advanced-action {
+  font-size: 24rpx;
+  color: #2B2622;
+}
+
+.advanced .option-block {
+  margin: 20rpx 0 0;
+}
+
+.advanced .notice {
+  padding-left: 0;
+}
+
+.applied {
+  color: #2B2622;
+}
+
+.escape-link {
+  margin-top: 20rpx;
+  padding: 12rpx 0;
+  text-align: center;
+  font-size: 24rpx;
+  color: #7A6F66;
+}
+
+.escape-btn {
+  margin-top: 20rpx;
+}
+
+.regenerate {
+  margin-top: 0;
+}
+
 .chip {
   margin-right: 16rpx;
   padding: 12rpx 24rpx;

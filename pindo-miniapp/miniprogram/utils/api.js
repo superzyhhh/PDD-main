@@ -67,6 +67,7 @@ async function generate(arrayBuffer, options = {}) {
     'x-palette-tier': options.paletteTier || 'basic',
   };
   if (token) header['x-session-token'] = token;
+  if (options.settings) header['x-advanced-settings'] = JSON.stringify(options.settings);
 
   const response = await request({
     url: `${config.BASE_URL}/api/generate`,
@@ -88,6 +89,25 @@ async function getTask(taskId) {
   });
   if (response.statusCode === 200) return response.data;
   throw apiErrorFrom(response, '任务查询失败，请重新生成');
+}
+
+// 三候选全不满意：带上原图与任务号，服务端留档参数与三候选供后台回看。
+async function reportFailureSample(taskId, arrayBuffer, contentType = 'image/png') {
+  const token = await ensureSession();
+  const header = {
+    'content-type': contentType || 'image/png',
+    'x-task-id': taskId,
+  };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/failure-samples`,
+    method: 'POST',
+    data: arrayBuffer,
+    timeout: 20000,
+    header,
+  });
+  if (response.statusCode === 201) return response.data;
+  throw apiErrorFrom(response, '反馈提交失败，请稍后重试');
 }
 
 // 导出：服务端校验登录与每日额度，返回可下载资源；type 为 hd（PNG）或 tiled（A4 PDF）。
@@ -239,6 +259,7 @@ module.exports = {
   ApiError,
   generate,
   getTask,
+  reportFailureSample,
   reportEvent,
   createExport,
   downloadExport,

@@ -11,17 +11,74 @@ const PATTERN_LIMIT = 50;
 const DEFAULT_PICK_HINT = '三个候选，选一张你更愿意照着拼的';
 const REOPEN_HINT = '已从「我的图纸」打开，可直接导出';
 
+const BASIC_SERIES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M'];
+const ADVANCED_SERIES = ['P', 'Q', 'R', 'T', 'Y', 'ZG'];
+
+const DEFAULT_ADVANCED_SETTINGS = {
+  dithering: 'auto',
+  background: 'auto',
+  maxColors: 'auto',
+  downscale: 'auto',
+  series: [],
+};
+
+const SETTING_LABELS = {
+  dithering: {
+    auto: '自动抖动',
+    none: '无抖动',
+    'floyd-steinberg': 'Floyd–Steinberg 抖动',
+  },
+  background: { auto: '自动裁背景', keep: '保留整图' },
+  downscale: {
+    auto: '自动降采样',
+    average: '平均降采样',
+    'edge-aware': '边缘感知降采样',
+    dominant: '主色降采样',
+  },
+};
+
 Page({
   data: {
-    stage: 'idle', // idle | uploading | processing | preview | error
+    stage: 'idle', // idle | uploading | processing | preview | error | dissatisfied
     statusText: '',
     message: '',
     canRetry: false,
     taskId: '',
     patternId: '',
     previewHint: DEFAULT_PICK_HINT,
+    hasImage: false,
     sizeTier: 'small',
     paletteTier: 'basic',
+    advancedOpen: false,
+    advanced: { ...DEFAULT_ADVANCED_SETTINGS },
+    advancedDirty: false,
+    appliedSettings: '',
+    sampleReporting: false,
+    sampleReported: false,
+    maxColorsId: 'auto',
+    ditheringOptions: [
+      { id: 'auto', label: '自动' },
+      { id: 'none', label: '无抖动' },
+      { id: 'floyd-steinberg', label: 'Floyd–Steinberg' },
+    ],
+    backgroundOptions: [
+      { id: 'auto', label: '自动裁背景' },
+      { id: 'keep', label: '保留整图' },
+    ],
+    downscaleOptions: [
+      { id: 'auto', label: '自动' },
+      { id: 'average', label: '平均' },
+      { id: 'edge-aware', label: '边缘感知' },
+      { id: 'dominant', label: '主色' },
+    ],
+    maxColorsOptions: [
+      { id: 'auto', label: '自动' },
+      { id: '16', label: '16 色' },
+      { id: '24', label: '24 色' },
+      { id: '32', label: '32 色' },
+      { id: '48', label: '48 色' },
+    ],
+    seriesOptions: seriesOptionsFor([], 'basic'),
     sizeOptions: [
       { id: 'small', label: '小 29×29' },
       { id: 'medium', label: '中 58×58' },
@@ -64,6 +121,9 @@ Page({
       statusText: '正在打开图纸',
       message: '',
       canRetry: false,
+      hasImage: false,
+      advancedDirty: false,
+      appliedSettings: '',
       candidates: [],
       selectedIndex: -1,
       candidate: null,
@@ -105,7 +165,73 @@ Page({
   },
 
   selectPalette(event) {
-    this.setData({ paletteTier: event.currentTarget.dataset.id });
+    const paletteTier = event.currentTarget.dataset.id;
+    const advanced = { ...this.data.advanced };
+    let trimmed = false;
+    if (paletteTier === 'basic') {
+      const kept = advanced.series.filter((code) => BASIC_SERIES.includes(code));
+      trimmed = kept.length !== advanced.series.length;
+      advanced.series = kept;
+    }
+    const update = {
+      paletteTier,
+      advanced,
+      seriesOptions: seriesOptionsFor(advanced.series, paletteTier),
+    };
+    if (trimmed) {
+      update.advancedDirty = true;
+      update.appliedSettings = '';
+    }
+    this.setData(update);
+    if (trimmed) wx.showToast({ title: '已移除进阶系列色', icon: 'none' });
+  },
+
+  toggleAdvanced() {
+    this.setData({ advancedOpen: !this.data.advancedOpen });
+  },
+
+  selectAdvancedOption(event) {
+    const field = event.currentTarget.dataset.field;
+    const value = event.currentTarget.dataset.value;
+    if (!field || !value) return;
+    if (field === 'maxColors') {
+      const maxColors = value === 'auto' ? 'auto' : Number(value);
+      this.applyAdvancedChange({ maxColors }, String(maxColors));
+      return;
+    }
+    this.applyAdvancedChange({ [field]: value });
+  },
+
+  toggleSeries(event) {
+    const code = event.currentTarget.dataset.code;
+    if (code === undefined) return;
+    const series =
+      code === ''
+        ? []
+        : this.data.advanced.series.includes(code)
+          ? this.data.advanced.series.filter((item) => item !== code)
+          : [...this.data.advanced.series, code];
+    this.applyAdvancedChange({ series });
+  },
+
+  /** 改动立即标脏：下一次生成才生效，预览页给出重新生成入口。 */
+  applyAdvancedChange(patch, maxColorsId) {
+    const advanced = { ...this.data.advanced, ...patch };
+    this.setData({
+      advanced,
+      advancedDirty: true,
+      appliedSettings: '',
+      maxColorsId: maxColorsId === undefined ? String(advanced.maxColors) : maxColorsId,
+      seriesOptions: seriesOptionsFor(advanced.series, this.data.paletteTier),
+    });
+  },
+
+  regenerate() {
+    if (!this.imageBuffer) {
+      wx.showToast({ title: '请先选择一张图片', icon: 'none' });
+      return;
+    }
+    this.startGenerate();
   },
 
   chooseImage() {
@@ -124,6 +250,8 @@ Page({
           filePath: file.tempFilePath,
           success: (result) => {
             this.imageBuffer = result.data;
+            this.imagePath = file.tempFilePath;
+            this.imageContentType = contentTypeForPath(file.tempFilePath);
             this.startGenerate();
           },
           fail: () => this.showError('读取图片失败，请换一张图', false),
@@ -150,8 +278,13 @@ Page({
       statusText: '正在上传图片',
       message: '',
       canRetry: false,
+      hasImage: true,
       patternId: '',
       previewHint: DEFAULT_PICK_HINT,
+      advancedDirty: false,
+      appliedSettings: '',
+      sampleReporting: false,
+      sampleReported: false,
       candidates: [],
       selectedIndex: -1,
       candidate: null,
@@ -163,6 +296,7 @@ Page({
       const task = await api.generate(this.imageBuffer, {
         sizeTier: this.data.sizeTier,
         paletteTier: this.data.paletteTier,
+        settings: this.data.advanced,
       });
       this.setData({
         stage: 'processing',
@@ -172,7 +306,15 @@ Page({
       this.poll(task.taskId);
     } catch (error) {
       const fallback = error.code === 'advanced-not-allowed';
-      if (fallback) this.setData({ paletteTier: 'basic' });
+      if (fallback) {
+        const advanced = { ...this.data.advanced };
+        advanced.series = advanced.series.filter((code) => BASIC_SERIES.includes(code));
+        this.setData({
+          paletteTier: 'basic',
+          advanced,
+          seriesOptions: seriesOptionsFor(advanced.series, 'basic'),
+        });
+      }
       this.showError(
         error.message,
         fallback || error.code === 'network' || error.code === 'internal',
@@ -226,6 +368,7 @@ Page({
     }));
     const thumbCell = Math.max(1, Math.floor(THUMB_WIDTH / list[0].width));
     const thumbSize = list[0].width * thumbCell;
+    const applied = task.settings || DEFAULT_ADVANCED_SETTINGS;
     this.setData({
       stage: 'preview',
       message: '',
@@ -237,6 +380,11 @@ Page({
       candidate: null,
       canvasSize: 0,
       thumbSize,
+      advanced: applied,
+      maxColorsId: String(applied.maxColors),
+      seriesOptions: seriesOptionsFor(applied.series, this.data.paletteTier),
+      advancedDirty: false,
+      appliedSettings: isCustomSettings(applied) ? describeSettings(applied) : '',
     });
     wx.nextTick(() => {
       list.forEach((candidate, index) => this.paint(`#thumb-${index}`, candidate, thumbCell, false));
@@ -295,6 +443,73 @@ Page({
     Promise.all(pending).then((results) => {
       delete this.reportingSelections[key];
       if (results.every(Boolean)) this.reportedSelections[key] = true;
+    });
+  },
+
+  /** 三张都不满意：进入逃生状态，并把原图与参数留档给后台回看。 */
+  async openDissatisfied() {
+    if (this.data.stage !== 'preview' || !this.imageBuffer) return;
+    this.setData({
+      stage: 'dissatisfied',
+      message: '',
+      canRetry: false,
+      sampleReporting: true,
+      sampleReported: false,
+    });
+    const reported = await this.reportFailureSample();
+    this.setData({ sampleReporting: false, sampleReported: reported });
+  },
+
+  /** 上报失败样本；同一任务只报一次，失败自动再试一次，结果决定页面文案。 */
+  async reportFailureSample() {
+    const taskId = this.data.taskId;
+    const image = this.imageBuffer;
+    if (!taskId || !image) return false;
+    this.reportedFailureSamples = this.reportedFailureSamples || {};
+    if (this.reportedFailureSamples[taskId]) return true;
+
+    const contentType = this.imageContentType || 'image/png';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await api.reportFailureSample(taskId, image, contentType);
+        this.reportedFailureSamples[taskId] = true;
+        return true;
+      } catch {
+        if (attempt === 0) await delay(800);
+      }
+    }
+    return false;
+  },
+
+  /** 打开微信自带裁剪界面让用户圈出主体，裁完按当前设置重新生成。 */
+  cropSubject() {
+    if (!this.imagePath) {
+      wx.showToast({ title: '没有可裁剪的原图，请换一张图', icon: 'none' });
+      return;
+    }
+    if (typeof wx.editImage !== 'function') {
+      wx.showToast({ title: '当前微信版本不支持裁主体，请换一张图', icon: 'none' });
+      return;
+    }
+    wx.editImage({
+      src: this.imagePath,
+      success: (res) => {
+        const croppedPath = res.tempFilePath;
+        wx.getFileSystemManager().readFile({
+          filePath: croppedPath,
+          success: (result) => {
+            this.imageBuffer = result.data;
+            this.imagePath = croppedPath;
+            this.imageContentType = contentTypeForPath(croppedPath);
+            this.startGenerate();
+          },
+          fail: () => wx.showToast({ title: '读取裁剪图失败，请换一张图', icon: 'none' }),
+        });
+      },
+      fail: (err) => {
+        if (err && /cancel/.test(err.errMsg || '')) return;
+        wx.showToast({ title: '无法打开裁剪，请换一张图', icon: 'none' });
+      },
     });
   },
 
@@ -437,6 +652,51 @@ function luminance(hex) {
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** 系列色 chips：第一项「全部」清空过滤，基础档只给基础系列，进阶档追加进阶系列。 */
+function seriesOptionsFor(series, paletteTier) {
+  const codes = paletteTier === 'advanced' ? [...BASIC_SERIES, ...ADVANCED_SERIES] : BASIC_SERIES;
+  return [
+    { key: 'all', code: '', label: '全部', active: series.length === 0 },
+    ...codes.map((code) => ({ key: code, code, label: code, active: series.includes(code) })),
+  ];
+}
+
+/** 只有动过高级参数才回显「本次已应用」，保持零参数主流程干净。 */
+function isCustomSettings(settings) {
+  return (
+    settings.dithering !== 'auto' ||
+    settings.background !== 'auto' ||
+    settings.downscale !== 'auto' ||
+    settings.maxColors !== 'auto' ||
+    settings.series.length > 0
+  );
+}
+
+function describeSettings(settings) {
+  const parts = [
+    `抖动：${SETTING_LABELS.dithering[settings.dithering]}`,
+    `背景：${SETTING_LABELS.background[settings.background]}`,
+    `色号：${settings.maxColors === 'auto' ? '自动' : `${settings.maxColors} 色上限`}`,
+    `降采样：${SETTING_LABELS.downscale[settings.downscale]}`,
+    `系列：${settings.series.length ? settings.series.join('/') : '全部'}`,
+  ];
+  return `本次已应用 · ${parts.join(' · ')}`;
+}
+
+function contentTypeForPath(path) {
+  const ext = String(path || '')
+    .split('.')
+    .pop()
+    .toLowerCase();
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'webp') return 'image/webp';
+  return 'image/png';
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

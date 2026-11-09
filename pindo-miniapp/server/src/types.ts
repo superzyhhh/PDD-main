@@ -1,3 +1,5 @@
+import type { AdvancedSettings } from './advanced-settings';
+
 export const PALETTE_TIERS = ['basic', 'advanced'] as const;
 
 export type PaletteTier = (typeof PALETTE_TIERS)[number];
@@ -54,6 +56,8 @@ export interface TaskView {
   failure?: TaskFailure;
   /** 登录用户生成完成后的保存结果；未登录或保存失败时不存在。 */
   savedPattern?: SavedPattern;
+  /** 本次生成实际应用的高级设置，用于客户端明确反馈。 */
+  settings?: AdvancedSettings;
 }
 
 /** 「我的图纸」保存结果；evictedCount 用于提示用户旧图已被清理。 */

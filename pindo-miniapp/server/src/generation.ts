@@ -1,4 +1,5 @@
 import sharp from 'sharp';
+import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
 import { downscale, type DownscaledPixel, type PixelationMode } from './vendor/pindo-engine/downscaler';
 import { matchColor, matchColors } from './vendor/pindo-engine/color-matcher';
 import { applyDithering } from './vendor/pindo-engine/dithering';
@@ -49,6 +50,8 @@ const STRATEGY_PARAMS: Record<CandidateId, StrategyParams> = {
 export interface GenerationOptions {
   sizeTier: SizeTier;
   paletteTier: PaletteTier;
+  /** 高级设置；缺省时三候选沿用各自的自动策略。 */
+  settings?: AdvancedSettings;
 }
 
 /** 一张图纸的格网规格：格宽、拼板数与所属色卡档位。 */
@@ -101,20 +104,30 @@ export function generateCandidates(
   palette: CompiledBeadColor[],
   options: GenerationOptions,
 ): Candidate[] {
+  const settings = options.settings ?? DEFAULT_ADVANCED_SETTINGS;
   const gridSize = SIZE_TIER_GRID[options.sizeTier];
   const spec: GridSpec = {
     gridSize,
     boardCount: (gridSize / BOARD_SIZE) ** 2,
     paletteTier: options.paletteTier,
   };
-  const cropped = cropToSubject(image.data, image.width, image.height, { background: 'white' });
+  const cropped =
+    settings.background === 'keep'
+      ? { data: image.data, width: image.width, height: image.height }
+      : cropToSubject(image.data, image.width, image.height, { background: 'white' });
 
   return CANDIDATE_IDS.map((id) => {
+    const base = STRATEGY_PARAMS[id];
     const strategy: CandidateStrategy = {
       id,
-      ...STRATEGY_PARAMS[id],
-      // 档位上限即基础/进阶色卡的总数，任何策略都不得突破。
-      maxColors: Math.min(STRATEGY_PARAMS[id].maxColors, palette.length),
+      downscale: settings.downscale === 'auto' ? base.downscale : settings.downscale,
+      dithering: settings.dithering === 'auto' ? base.dithering : settings.dithering,
+      // 高级色号上限与档位上限取小，任何策略都不得突破。
+      maxColors: Math.min(
+        base.maxColors,
+        settings.maxColors === 'auto' ? Number.POSITIVE_INFINITY : settings.maxColors,
+        palette.length,
+      ),
     };
     return buildCandidate(cropped, palette, strategy, spec);
   });

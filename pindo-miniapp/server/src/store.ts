@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import type { Candidate, SavedPattern, TaskFailure, TaskFailureCode, TaskStatus, TaskView } from './types';
+import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
+import type {
+  Candidate,
+  PaletteTier,
+  SavedPattern,
+  SizeTier,
+  TaskFailure,
+  TaskFailureCode,
+  TaskStatus,
+  TaskView,
+} from './types';
 
 interface TaskRecord {
   id: string;
@@ -9,7 +19,17 @@ interface TaskRecord {
   candidates?: Candidate[];
   failure?: TaskFailure;
   savedPattern?: SavedPattern;
+  sizeTier?: SizeTier;
+  paletteTier?: PaletteTier;
+  settings?: AdvancedSettings;
   createdAt: number;
+}
+
+/** 创建任务时一并保存的生成参数，便于回显与失败样本留档。 */
+export interface TaskMeta {
+  sizeTier: SizeTier;
+  paletteTier: PaletteTier;
+  settings: AdvancedSettings;
 }
 
 const MAX_TASKS = 200;
@@ -19,12 +39,15 @@ export class TaskStore {
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly byContent = new Map<string, string>();
 
-  create(contentKey: string, openId?: string): TaskRecord {
+  create(contentKey: string, openId?: string, meta?: TaskMeta): TaskRecord {
     const record: TaskRecord = {
       id: randomUUID(),
       contentKey,
       openId,
       status: 'queued',
+      sizeTier: meta?.sizeTier,
+      paletteTier: meta?.paletteTier,
+      settings: meta?.settings,
       createdAt: Date.now(),
     };
     this.tasks.set(record.id, record);
@@ -50,6 +73,20 @@ export class TaskStore {
   setSavedPattern(id: string, saved: SavedPattern): void {
     const record = this.tasks.get(id);
     if (record) record.savedPattern = saved;
+  }
+
+  /** 任务创建时的生成参数与结果快照；用于失败样本留档。 */
+  taskMeta(id: string): (TaskMeta & { openId?: string; status: TaskStatus; candidates?: Candidate[] }) | undefined {
+    const record = this.tasks.get(id);
+    if (!record) return undefined;
+    return {
+      openId: record.openId,
+      status: record.status,
+      sizeTier: record.sizeTier ?? 'small',
+      paletteTier: record.paletteTier ?? 'basic',
+      settings: record.settings ?? DEFAULT_ADVANCED_SETTINGS,
+      candidates: record.candidates,
+    };
   }
 
   markProcessing(id: string): void {
@@ -78,6 +115,7 @@ export class TaskStore {
     if (record.candidates) view.candidates = record.candidates;
     if (record.failure) view.failure = record.failure;
     if (record.savedPattern) view.savedPattern = record.savedPattern;
+    if (record.settings) view.settings = record.settings;
     return view;
   }
 

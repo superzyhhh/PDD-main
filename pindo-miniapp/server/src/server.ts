@@ -1,6 +1,14 @@
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { parseAnalyticsEvent } from './analytics';
+import {
+  DEFAULT_ADVANCED_SETTINGS,
+  filterPaletteBySeries,
+  parseAdvancedSettings,
+  settingsFingerprint,
+  type AdvancedSettings,
+} from './advanced-settings';
+import { FailureSampleStore, MAX_FAILURE_SAMPLES } from './failure-samples';
 import { ImageDecodeError, decodeImage, generateCandidates } from './generation';
 import {
   ExportStore,
@@ -43,6 +51,8 @@ export interface ServerOptions {
   now?: () => Date;
   /** 291 进阶档的额外白名单（运营/测试用）；会员资格由服务端会员状态判定。 */
   isAdvancedPaletteAllowed?: (openId?: string) => boolean;
+  /** 失败样本后台口令；未配置时后台查询接口不开放。 */
+  adminToken?: string;
 }
 
 class BodyTooLargeError extends Error {}
@@ -79,8 +89,16 @@ function readBody(req: IncomingMessage, limit = MAX_UPLOAD_BYTES): Promise<Buffe
   });
 }
 
-function contentKey(buffer: Buffer, sizeTier: string, paletteTier: string): string {
-  return createHash('sha256').update(buffer).update(`|${sizeTier}|${paletteTier}`).digest('hex');
+function contentKey(
+  buffer: Buffer,
+  sizeTier: string,
+  paletteTier: string,
+  settings: AdvancedSettings,
+): string {
+  return createHash('sha256')
+    .update(buffer)
+    .update(`|${sizeTier}|${paletteTier}|${settingsFingerprint(settings)}`)
+    .digest('hex');
 }
 
 function failureFor(error: unknown): { code: TaskFailureCode; message: string } {
@@ -101,6 +119,7 @@ export function createServer(options: ServerOptions): Server {
   const exportStore = new ExportStore();
   const patterns = new PatternStore();
   const memberships = new MembershipStore();
+  const failureSamples = new FailureSampleStore();
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
@@ -138,12 +157,21 @@ export function createServer(options: ServerOptions): Server {
     return result;
   }
 
-  async function runTask(taskId: string, image: Buffer, sizeTier: SizeTier, paletteTier: PaletteTier): Promise<void> {
+  async function runTask(
+    taskId: string,
+    image: Buffer,
+    sizeTier: SizeTier,
+    paletteTier: PaletteTier,
+    settings: AdvancedSettings,
+  ): Promise<void> {
     store.markProcessing(taskId);
     try {
       const decoded = await decodeImage(image);
-      const palette = paletteTier === 'advanced' ? advancedPalette : basicPalette;
-      const candidates = generateCandidates(decoded, palette, { sizeTier, paletteTier });
+      const palette = filterPaletteBySeries(
+        paletteTier === 'advanced' ? advancedPalette : basicPalette,
+        settings.series,
+      );
+      const candidates = generateCandidates(decoded, palette, { sizeTier, paletteTier, settings });
       store.complete(taskId, candidates);
       // 未登录任务不落库；登录用户在生成完成时自动保存默认候选。
       const owner = store.ownerOf(taskId);
@@ -384,6 +412,20 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
+    const rawSettingsHeader = req.headers['x-advanced-settings'];
+    const rawSettings = Array.isArray(rawSettingsHeader) ? rawSettingsHeader[0] : rawSettingsHeader;
+    const parsedSettings = parseAdvancedSettings(rawSettings);
+    if (parsedSettings === null) {
+      sendError(res, 400, 'invalid-settings', '高级设置不可用，请重置后再试');
+      return;
+    }
+    const settings = parsedSettings ?? DEFAULT_ADVANCED_SETTINGS;
+    const sourcePalette = paletteTier === 'advanced' ? advancedPalette : basicPalette;
+    if (filterPaletteBySeries(sourcePalette, settings.series).length === 0) {
+      sendError(res, 400, 'invalid-settings', '当前系列过滤后没有可用色号，请放宽设置');
+      return;
+    }
+
     let image: Buffer;
     try {
       image = await readBody(req);
@@ -399,7 +441,7 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const key = contentKey(image, sizeTier, paletteTier);
+    const key = contentKey(image, sizeTier, paletteTier, settings);
     const reusable = reusableTaskFor(key, openId);
     if (reusable) {
       sendJson(res, 202, { taskId: reusable.id, status: reusable.status });
@@ -437,9 +479,9 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const task = store.create(key, openId);
+    const task = store.create(key, openId, { sizeTier, paletteTier, settings });
     sendJson(res, 202, { taskId: task.id, status: task.status });
-    setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier));
+    setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier, settings));
   }
 
   /** 取当前登录账号；未登录时回 401 并返回 undefined。 */
@@ -525,6 +567,110 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
     sendJson(res, 200, { ok: true });
+  }
+
+  function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
+    if (!options.adminToken) {
+      sendError(res, 404, 'samples-disabled', '失败样本后台未启用');
+      return false;
+    }
+    if (String(req.headers['x-admin-token'] ?? '') !== options.adminToken) {
+      sendError(res, 403, 'admin-forbidden', '无权查看失败样本');
+      return false;
+    }
+    return true;
+  }
+
+  /** 三候选全不满意：把原图、参数与三候选一起留档，供后台回看。 */
+  async function handleReportFailureSample(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const taskId = String(req.headers['x-task-id'] ?? '');
+    if (!taskId) {
+      sendError(res, 400, 'invalid-sample', '缺少图纸信息，请重新生成后再反馈');
+      return;
+    }
+    const meta = store.taskMeta(taskId);
+    if (!meta) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (meta.status !== 'completed' || !meta.candidates?.length) {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再反馈');
+      return;
+    }
+    const openId = requestOpenId(req);
+    if (meta.openId && meta.openId !== openId) {
+      sendError(res, 403, 'sample-forbidden', '无权提交该图纸的反馈');
+      return;
+    }
+
+    let image: Buffer;
+    try {
+      image = await readBody(req);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        sendError(res, 413, 'image-too-large', '图片太大，请换一张小于 10MB 的图片');
+        return;
+      }
+      throw error;
+    }
+    if (image.length === 0) {
+      sendError(res, 400, 'empty-image', '没有收到图片，请重新上传');
+      return;
+    }
+
+    const sample = failureSamples.add({
+      taskId,
+      openId: meta.openId,
+      sizeTier: meta.sizeTier,
+      paletteTier: meta.paletteTier,
+      settings: meta.settings,
+      candidates: meta.candidates,
+      image,
+      imageContentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
+    });
+    logger.audit('failure_sample', {
+      sampleId: sample.id,
+      taskId,
+      openId: meta.openId,
+      at: new Date().toISOString(),
+    });
+    sendJson(res, 201, { sampleId: sample.id });
+  }
+
+  function handleListFailureSamples(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res)) return;
+    const rawLimit = Number(url.searchParams.get('limit') ?? '20');
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(1, Math.floor(rawLimit)), MAX_FAILURE_SAMPLES)
+      : 20;
+    sendJson(res, 200, {
+      samples: failureSamples.list(limit).map((sample) => ({
+        id: sample.id,
+        taskId: sample.taskId,
+        openId: sample.openId,
+        sizeTier: sample.sizeTier,
+        paletteTier: sample.paletteTier,
+        settings: sample.settings,
+        candidates: sample.candidates,
+        imageUrl: `/api/failure-samples/${sample.id}/image`,
+        createdAt: new Date(sample.createdAt).toISOString(),
+      })),
+    });
+  }
+
+  function handleFailureSampleImage(req: IncomingMessage, res: ServerResponse, sampleId: string): void {
+    if (!requireAdmin(req, res)) return;
+    const sample = failureSamples.get(sampleId);
+    if (!sample) {
+      sendError(res, 404, 'sample-not-found', '失败样本不存在');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': sample.imageContentType,
+      'content-length': String(sample.image.length),
+      'cache-control': 'no-store',
+    });
+    res.end(sample.image);
   }
 
   async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -792,6 +938,22 @@ export function createServer(options: ServerOptions): Server {
           handleDeletePattern(req, res, patternId);
           return;
         }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/failure-samples') {
+        await handleReportFailureSample(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/failure-samples') {
+        handleListFailureSamples(req, res, url);
+        return;
+      }
+
+      const sampleImageMatch = url.pathname.match(/^\/api\/failure-samples\/([^/]+)\/image$/);
+      if (req.method === 'GET' && sampleImageMatch) {
+        handleFailureSampleImage(req, res, decodeURIComponent(sampleImageMatch[1]));
+        return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/exports') {

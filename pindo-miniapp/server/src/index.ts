@@ -41,6 +41,12 @@ const advancedOpenIds = (process.env.ADVANCED_PALETTE_OPENIDS ?? '')
 const isAdvancedPaletteAllowed = (openId?: string): boolean =>
   !!openId && advancedOpenIds.includes(openId);
 
-createServer({ moderation, session, payment, isAdvancedPaletteAllowed }).listen(port, () => {
+createServer({
+  moderation,
+  session,
+  payment,
+  isAdvancedPaletteAllowed,
+  adminToken: process.env.ADMIN_TOKEN,
+}).listen(port, () => {
   console.log(`[pindo-miniapp] server listening on :${port}`);
 });
