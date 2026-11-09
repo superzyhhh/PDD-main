@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AdvancedSettings } from './advanced-settings';
+import type { StyleId } from './style';
 import type { Candidate, PaletteTier, SizeTier } from './types';
 
 /** 失败样本只保留最近 50 条，避免长期占用内存。 */
@@ -11,6 +12,7 @@ export interface FailureSampleInput {
   sizeTier: SizeTier;
   paletteTier: PaletteTier;
   settings: AdvancedSettings;
+  style: StyleId;
   candidates: Candidate[];
   /** 用户上传的原图，用于运营回看。 */
   image: Buffer;

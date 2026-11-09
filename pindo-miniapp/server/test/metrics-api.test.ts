@@ -4,7 +4,9 @@ import sharp from 'sharp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type ServerOptions } from '../src/server';
 import type { Moderation } from '../src/moderation';
+import { MetricsStore } from '../src/metrics';
 import { createSandboxPaymentProvider } from '../src/payment';
+import { createFakeStyleProvider, type StyleProvider } from '../src/style';
 
 const DAY = 24 * 60 * 60 * 1000;
 const allowAll: Moderation = { check: async () => 'pass' };
@@ -77,6 +79,7 @@ async function generate(
   token?: string,
   channel?: string,
   variant = 0,
+  style?: string,
 ): Promise<Record<string, any>> {
   const headers: Record<string, string> = {
     'content-type': 'application/octet-stream',
@@ -85,6 +88,7 @@ async function generate(
   };
   if (token) headers['x-session-token'] = token;
   if (channel) headers['x-channel'] = channel;
+  if (style) headers['x-style'] = style;
   const response = await fetch(`${baseUrl}/api/generate`, {
     method: 'POST',
     headers,
@@ -151,6 +155,10 @@ async function summary(
   });
   expect(response.status).toBe(200);
   return (await response.json()) as Record<string, any>;
+}
+
+function styleEntry(body: Record<string, any>, style: string): Record<string, any> {
+  return body.byStyle.find((entry: any) => entry.style === style);
 }
 
 function blindTest(baseUrl: string, adminToken: string, body: unknown): Promise<Response> {
@@ -320,12 +328,148 @@ describe('埋点与验证看板', () => {
     expect(invalid.status).toBe(400);
   });
 
+  it('看板按风格拆分生成量、用户数与接受率，并叠加时间与渠道过滤', async () => {
+    const adminToken = 'metrics-admin';
+    const baseUrl = await startApp({ adminToken, style: createFakeStyleProvider() });
+    const token = await login(baseUrl, 'style-viewer');
+
+    await generate(baseUrl, token, 'xiaohongshu', 0);
+    const animeTask = await generate(baseUrl, token, 'xiaohongshu', 1, 'anime');
+    await generate(baseUrl, token, 'douyin', 2, 'chibi');
+    await acceptFirst(baseUrl, token, animeTask);
+
+    const xhs = await summary(baseUrl, adminToken, { channel: 'xiaohongshu' });
+    expect(styleEntry(xhs, 'original')).toMatchObject({
+      generation: { tasks: 1, users: 1 },
+      firstAcceptance: { count: 0, rate: 0 },
+      styleFailure: { count: 0, rate: 0 },
+    });
+    expect(styleEntry(xhs, 'anime')).toMatchObject({
+      generation: { tasks: 1, users: 1 },
+      firstAcceptance: { count: 1, rate: 1 },
+      styleFailure: { count: 0, rate: 0 },
+    });
+    expect(styleEntry(xhs, 'chibi')).toMatchObject({
+      generation: { tasks: 0, users: 0 },
+      firstAcceptance: { count: 0, rate: null },
+      styleFailure: { count: 0, rate: null },
+    });
+
+    const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
+    expect(styleEntry(douyin, 'chibi')).toMatchObject({ generation: { tasks: 1, users: 1 } });
+    expect(styleEntry(douyin, 'anime')).toMatchObject({ generation: { tasks: 0, users: 0 } });
+
+    // 时间与渠道同时生效时仍按风格拆分。
+    const combined = await summary(baseUrl, adminToken, {
+      channel: 'xiaohongshu',
+      from: new Date(clock - 60_000),
+    });
+    expect(styleEntry(combined, 'anime')).toMatchObject({
+      generation: { tasks: 1, users: 1 },
+      firstAcceptance: { count: 1, rate: 1 },
+      styleFailure: { count: 0, rate: 0 },
+    });
+    expect(styleEntry(combined, 'chibi')).toMatchObject({ generation: { tasks: 0, users: 0 } });
+
+    const future = await summary(baseUrl, adminToken, {
+      channel: 'xiaohongshu',
+      from: new Date(clock + DAY),
+    });
+    for (const entry of future.byStyle) {
+      expect(entry.generation.tasks).toBe(0);
+      expect(entry.firstAcceptance.rate).toBeNull();
+      expect(entry.styleFailure.rate).toBeNull();
+    }
+  });
+
+  it('看板按风格统计风格化失败次数与失败率，同一任务只计一次', async () => {
+    const base = createFakeStyleProvider();
+    const flaky: StyleProvider = {
+      available: true,
+      version: 'flaky-v1',
+      async stylize(input) {
+        if (input.style === 'chibi') throw new Error('provider down');
+        return base.stylize(input);
+      },
+    };
+    const adminToken = 'metrics-admin';
+    const baseUrl = await startApp({ adminToken, style: flaky });
+    const token = await login(baseUrl, 'style-failure');
+
+    await generate(baseUrl, token, 'xiaohongshu', 0, 'anime');
+    const failed = await generate(baseUrl, token, 'xiaohongshu', 1, 'chibi');
+    expect(failed.status).toBe('failed');
+    expect(failed.failure.code).toBe('style-failed');
+
+    const xhs = await summary(baseUrl, adminToken, { channel: 'xiaohongshu' });
+    expect(styleEntry(xhs, 'anime')).toMatchObject({
+      generation: { tasks: 1, users: 1 },
+      styleFailure: { count: 0, rate: 0 },
+    });
+    expect(styleEntry(xhs, 'chibi')).toMatchObject({
+      generation: { tasks: 0, users: 0 },
+      styleFailure: { count: 1, rate: 1 },
+    });
+
+    const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
+    expect(styleEntry(douyin, 'chibi')).toMatchObject({ styleFailure: { count: 0, rate: null } });
+
+    // 时间与渠道同时生效时仍按风格统计失败。
+    const combined = await summary(baseUrl, adminToken, {
+      channel: 'xiaohongshu',
+      from: new Date(clock - 60_000),
+    });
+    expect(styleEntry(combined, 'chibi')).toMatchObject({ styleFailure: { count: 1, rate: 1 } });
+
+    // 同一任务重复上报只计一次。
+    const store = new MetricsStore();
+    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'chibi', at: clock });
+    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'chibi', at: clock });
+    expect(styleEntry(store.summary(), 'chibi')!.styleFailure.count).toBe(1);
+  });
+
+  it('风格化内容不合规按独立失败原因结束，不混入风格化失败次数', async () => {
+    // 只在风格图（PNG）复核时拦截，原图上传仍放行。
+    const blockStyledOutput: Moderation = {
+      check: async ({ contentType }) => (contentType === 'image/png' ? 'block' : 'pass'),
+    };
+    const adminToken = 'metrics-admin';
+    const baseUrl = await startApp({
+      adminToken,
+      style: createFakeStyleProvider(),
+      moderation: blockStyledOutput,
+    });
+    const token = await login(baseUrl, 'style-blocked');
+
+    await generate(baseUrl, token, 'xiaohongshu', 0);
+    const blocked = await generate(baseUrl, token, 'xiaohongshu', 1, 'anime');
+    expect(blocked.status).toBe('failed');
+    expect(blocked.failure.code).toBe('style-blocked');
+
+    const view = await summary(baseUrl, adminToken, { channel: 'xiaohongshu' });
+    expect(styleEntry(view, 'original')).toMatchObject({ generation: { tasks: 1, users: 1 } });
+    expect(styleEntry(view, 'anime')).toMatchObject({
+      generation: { tasks: 0, users: 0 },
+      styleFailure: { count: 0, rate: null },
+    });
+  });
+
   it('失败样本可按时间导出 CSV', async () => {
     const adminToken = 'metrics-admin';
-    const baseUrl = await startApp({ adminToken });
+    const baseUrl = await startApp({ adminToken, style: createFakeStyleProvider() });
     const token = await login(baseUrl, 'failure-owner');
-    const task = await generate(baseUrl, token, 'xiaohongshu', 0);
+    const task = await generate(baseUrl, token, 'xiaohongshu', 0, 'anime');
     const sampleId = await reportFailureSample(baseUrl, token, task.taskId, await subjectPng(0));
+
+    const listResponse = await fetch(`${baseUrl}/api/failure-samples?limit=20`, {
+      headers: { 'x-admin-token': adminToken },
+    });
+    expect(listResponse.status).toBe(200);
+    const list = (await listResponse.json()) as { samples: Array<Record<string, any>> };
+    expect(list.samples[0]).toMatchObject({
+      taskId: task.taskId,
+      style: 'anime',
+    });
 
     const from = new Date(clock - 60_000);
     const to = new Date(clock + 60_000);
@@ -339,13 +483,14 @@ describe('埋点与验证看板', () => {
 
     const lines = (await response.text()).trim().split('\n');
     expect(lines[0]).toBe(
-      'sampleId,taskId,openId,sizeTier,paletteTier,settings,createdAt,imageUrl',
+      'sampleId,taskId,openId,sizeTier,paletteTier,settings,createdAt,imageUrl,style',
     );
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain(sampleId);
     expect(lines[1]).toContain(task.taskId);
     expect(lines[1]).toContain(`/api/failure-samples/${sampleId}/image`);
     expect(lines[1]).toContain('""dithering"":');
+    expect(lines[1].endsWith(',anime')).toBe(true);
 
     const future = new URLSearchParams({
       from: new Date(clock + DAY).toISOString(),

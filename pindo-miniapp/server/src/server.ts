@@ -206,7 +206,19 @@ export function createServer(options: ServerOptions): Server {
       stage,
       error: error instanceof Error ? error.message : String(error),
     });
+    recordStyleFailure(taskId, style);
     store.fail(taskId, 'style-failed', '风格化失败，请重试');
+  }
+
+  /** 风格化失败看板事件：同一任务只计一次，成功生成不污染失败口径。 */
+  function recordStyleFailure(taskId: string, style: StyleId): void {
+    metrics.recordStyleFailure({
+      taskId,
+      openId: store.ownerOf(taskId),
+      channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
+      style,
+      at: now().getTime(),
+    });
   }
 
   /** 给风格服务调用套上超时与取消，避免第三方无响应时任务一直挂起。 */
@@ -315,6 +327,7 @@ export function createServer(options: ServerOptions): Server {
         taskId,
         openId: owner,
         channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
+        style: meta.style,
         at: now().getTime(),
       });
       if (owner) savePattern(owner, taskId, candidates[0]);
@@ -395,6 +408,7 @@ export function createServer(options: ServerOptions): Server {
         taskId: event.taskId,
         openId: owner,
         channel: store.channelOf(event.taskId) ?? DEFAULT_CHANNEL,
+        style: store.taskMeta(event.taskId)?.style ?? DEFAULT_STYLE,
         at: now().getTime(),
       });
     }
@@ -812,6 +826,7 @@ export function createServer(options: ServerOptions): Server {
       sizeTier: meta.sizeTier,
       paletteTier: meta.paletteTier,
       settings: meta.settings,
+      style: meta.style,
       candidates: meta.candidates,
       image,
       imageContentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
@@ -839,6 +854,7 @@ export function createServer(options: ServerOptions): Server {
         sizeTier: sample.sizeTier,
         paletteTier: sample.paletteTier,
         settings: sample.settings,
+        style: sample.style,
         candidates: sample.candidates,
         imageUrl: `/api/failure-samples/${sample.id}/image`,
         createdAt: new Date(sample.createdAt).toISOString(),
@@ -884,12 +900,13 @@ export function createServer(options: ServerOptions): Server {
           JSON.stringify(sample.settings),
           new Date(sample.createdAt).toISOString(),
           `/api/failure-samples/${sample.id}/image`,
+          sample.style,
         ]
           .map(csvEscape)
           .join(','),
       );
     const csv = [
-      'sampleId,taskId,openId,sizeTier,paletteTier,settings,createdAt,imageUrl',
+      'sampleId,taskId,openId,sizeTier,paletteTier,settings,createdAt,imageUrl,style',
       ...rows,
     ].join('\n');
     const payload = `${csv}\n`;

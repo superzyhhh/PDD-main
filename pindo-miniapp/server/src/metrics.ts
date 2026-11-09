@@ -1,3 +1,5 @@
+import { STYLE_IDS, type StyleId } from './style';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** 验证期看板只保留最近的埋点，避免进程内数组无界增长。 */
 const MAX_METRIC_RECORDS = 2000;
@@ -58,6 +60,14 @@ export interface MetricFilter extends MetricRange {
   channel?: string;
 }
 
+export interface StyleSummaryEntry {
+  style: StyleId;
+  generation: { tasks: number; users: number };
+  firstAcceptance: { count: number; rate: number | null };
+  /** 风格化失败次数与失败率；分母为该风格的生成任务数加风格化失败数。 */
+  styleFailure: { count: number; rate: number | null };
+}
+
 export interface MetricsSummary {
   generation: { tasks: number; users: number };
   firstAcceptance: { count: number; rate: number | null };
@@ -75,12 +85,15 @@ export interface MetricsSummary {
     rate: number | null;
   };
   blindTests: BlindTestSummary;
+  /** 既有时间与渠道过滤下的按风格拆分。 */
+  byStyle: StyleSummaryEntry[];
 }
 
 interface TaskEvent {
   taskId: string;
   openId?: string;
   channel: string;
+  style: StyleId;
   at: number;
 }
 
@@ -93,20 +106,24 @@ interface UserEvent {
 export class MetricsStore {
   private readonly generations: TaskEvent[] = [];
   private readonly acceptances: TaskEvent[] = [];
+  private readonly styleFailures: TaskEvent[] = [];
   private readonly quotaExhausted: UserEvent[] = [];
   private readonly activations: UserEvent[] = [];
   private readonly blindTests = new Map<string, BlindTestRecord>();
 
   /** 同一任务完成只记一次；缓存复用不会重复计入生成量。 */
   recordGeneration(event: TaskEvent): void {
-    if (this.generations.some((item) => item.taskId === event.taskId)) return;
-    this.push(this.generations, event);
+    this.recordOnce(this.generations, event);
   }
 
   /** 同一任务的首图接受只记一次，客户端重试上报不会把接受率刷过 100%。 */
   recordAcceptance(event: TaskEvent): void {
-    if (this.acceptances.some((item) => item.taskId === event.taskId)) return;
-    this.push(this.acceptances, event);
+    this.recordOnce(this.acceptances, event);
+  }
+
+  /** 风格化失败同一任务只计一次；成功生成与内容不合规都不计入失败口径。 */
+  recordStyleFailure(event: TaskEvent): void {
+    this.recordOnce(this.styleFailures, event);
   }
 
   recordQuotaExhausted(openId: string, at: number): void {
@@ -163,10 +180,35 @@ export class MetricsStore {
       (item) => inRange(item.at) && inChannel(item.channel),
     );
     const generationIds = new Set(generations.map((item) => item.taskId));
-    const acceptedCount = this.acceptances.filter(
-      (item) =>
-        inRange(item.at) && inChannel(item.channel) && generationIds.has(item.taskId),
-    ).length;
+    const acceptanceIds = new Set(
+      this.acceptances
+        .filter((item) => inRange(item.at) && inChannel(item.channel))
+        .map((item) => item.taskId),
+    );
+    const acceptedCount = [...generationIds].filter((id) => acceptanceIds.has(id)).length;
+    const failures = this.styleFailures.filter(
+      (item) => inRange(item.at) && inChannel(item.channel),
+    );
+
+    // 按风格拆分叠加在时间与渠道过滤之上，不改变原有漏斗与留存口径。
+    const byStyle: StyleSummaryEntry[] = STYLE_IDS.map((style) => {
+      const styleGenerations = generations.filter((item) => item.style === style);
+      const styleTaskIds = new Set(styleGenerations.map((item) => item.taskId));
+      const styleAccepted = [...styleTaskIds].filter((id) => acceptanceIds.has(id)).length;
+      const styleUsers = new Set<string>();
+      for (const item of styleGenerations) if (item.openId) styleUsers.add(item.openId);
+      const styleFailures = failures.filter((item) => item.style === style).length;
+      const attempts = styleGenerations.length + styleFailures;
+      return {
+        style,
+        generation: { tasks: styleGenerations.length, users: styleUsers.size },
+        firstAcceptance: {
+          count: styleAccepted,
+          rate: styleGenerations.length === 0 ? null : styleAccepted / styleGenerations.length,
+        },
+        styleFailure: { count: styleFailures, rate: attempts === 0 ? null : styleFailures / attempts },
+      };
+    });
 
     const generatedUsers = new Set<string>();
     for (const item of generations) if (item.openId) generatedUsers.add(item.openId);
@@ -238,7 +280,13 @@ export class MetricsStore {
         rate: eligibleUsers === 0 ? null : repeatUsers / eligibleUsers,
       },
       blindTests: this.blindTestSummary(),
+      byStyle,
     };
+  }
+
+  private recordOnce(list: TaskEvent[], event: TaskEvent): void {
+    if (list.some((item) => item.taskId === event.taskId)) return;
+    this.push(list, event);
   }
 
   private push<T>(list: T[], item: T): void {
