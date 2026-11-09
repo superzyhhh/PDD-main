@@ -97,17 +97,9 @@ export async function decodeImage(buffer: Buffer): Promise<DecodedImage> {
   }
 }
 
-/** 把已解码并摆正的图像重新编码成 PNG，供风格服务使用（不带原始 EXIF）。 */
-export async function encodeImage(image: DecodedImage): Promise<Buffer> {
-  return sharp(image.data, {
-    raw: { width: image.width, height: image.height, channels: 4 },
-  })
-    .png()
-    .toBuffer();
-}
-
 /**
  * 抠主体一次，按尺寸档与色卡档、三套策略各出一张图纸；返回值顺序即展示顺序。
+ * 传入的图片应已按规格「先抠主体」准备好（见 prepareSubject）。
  */
 export function generateCandidates(
   image: DecodedImage,
@@ -121,10 +113,6 @@ export function generateCandidates(
     boardCount: (gridSize / BOARD_SIZE) ** 2,
     paletteTier: options.paletteTier,
   };
-  const cropped =
-    settings.background === 'keep'
-      ? { data: image.data, width: image.width, height: image.height }
-      : cropToSubject(image.data, image.width, image.height, { background: 'white' });
 
   return CANDIDATE_IDS.map((id) => {
     const base = STRATEGY_PARAMS[id];
@@ -139,8 +127,17 @@ export function generateCandidates(
         palette.length,
       ),
     };
-    return buildCandidate(cropped, palette, strategy, spec);
+    return buildCandidate(image, palette, strategy, spec);
   });
+}
+
+/** 按背景模式决定是否裁到主体；风格转换与出图共用同一份主体图。 */
+export function prepareSubject(
+  image: DecodedImage,
+  background: AdvancedSettings['background'],
+): DecodedImage {
+  if (background === 'keep') return image;
+  return cropToSubject(image.data, image.width, image.height, { background: 'white' });
 }
 
 function buildCandidate(

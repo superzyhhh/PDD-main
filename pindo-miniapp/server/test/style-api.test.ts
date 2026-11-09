@@ -6,6 +6,7 @@ import { createServer, type ServerOptions } from '../src/server';
 import type { Moderation } from '../src/moderation';
 import {
   STYLE_IDS,
+  STYLE_WORKING_SIZE,
   createFakeStyleProvider,
   styleCacheKey,
   type StyleProvider,
@@ -419,14 +420,15 @@ describe('风格缓存与失败降级', () => {
     expect(attempts).toBe(2);
   });
 
-  it('风格缓存键区分原图内容、风格与模型版本', async () => {
+  it('风格缓存键区分原图内容、风格、模型版本与背景模式', async () => {
     const image = await redSquarePng();
-    const key = styleCacheKey(image, 'anime', 'v1');
+    const key = styleCacheKey(image, 'anime', 'v1', 'auto');
 
-    expect(key).toBe(styleCacheKey(image, 'anime', 'v1'));
-    expect(key).not.toBe(styleCacheKey(image, 'anime', 'v2'));
-    expect(key).not.toBe(styleCacheKey(image, 'chibi', 'v1'));
-    expect(key).not.toBe(styleCacheKey(await redSquarePng(65), 'anime', 'v1'));
+    expect(key).toBe(styleCacheKey(image, 'anime', 'v1', 'auto'));
+    expect(key).not.toBe(styleCacheKey(image, 'anime', 'v2', 'auto'));
+    expect(key).not.toBe(styleCacheKey(image, 'chibi', 'v1', 'auto'));
+    expect(key).not.toBe(styleCacheKey(image, 'anime', 'v1', 'keep'));
+    expect(key).not.toBe(styleCacheKey(await redSquarePng(65), 'anime', 'v1', 'auto'));
   });
 
   it('换风格重新调用风格服务并产生新图纸', async () => {
@@ -513,7 +515,145 @@ describe('假风格服务', () => {
     expect(first.contentType).toBe('image/png');
     expect(first.buffer.equals(second.buffer)).toBe(true);
     const meta = await sharp(first.buffer).metadata();
-    expect(meta.width).toBe(64);
-    expect(meta.height).toBe(64);
+    expect(meta.width).toBe(STYLE_WORKING_SIZE);
+    expect(meta.height).toBe(STYLE_WORKING_SIZE);
+  });
+});
+
+/** 非白像素占比：用来判断风格转换拿到的是整图还是抠出的主体。 */
+async function nonWhiteRatio(buffer: Buffer): Promise<number> {
+  const { data, info } = await sharp(buffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  let count = 0;
+  for (let i = 0; i < data.length; i += info.channels) {
+    if (data[i] < 245 || data[i + 1] < 245 || data[i + 2] < 245) count += 1;
+  }
+  return count / (info.width * info.height);
+}
+
+/** 白底中央红色圆形：抠主体后四角仍留白，用来观察面积占比与色块连通性。 */
+async function redCirclePng(size = 96): Promise<Buffer> {
+  const raw = Buffer.alloc(size * size * 3, 255);
+  const center = (size - 1) / 2;
+  const radius = size * 0.35;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - center;
+      const dy = y - center;
+      if (dx * dx + dy * dy > radius * radius) continue;
+      const i = (y * size + x) * 3;
+      raw[i] = 200;
+      raw[i + 1] = 30;
+      raw[i + 2] = 40;
+    }
+  }
+  return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
+}
+
+/** 候选图纸上非白格网的面积占比与连通块数量。 */
+function gridStats(candidate: any): { ratio: number; components: number } {
+  const hex = new Map<string, string>(
+    (candidate.colors as Array<{ code: string; hex: string }>).map((color) => [
+      color.code,
+      color.hex,
+    ]),
+  );
+  const grid = candidate.grid as string[][];
+  const height = grid.length;
+  const width = grid[0].length;
+  const isSubject = (x: number, y: number): boolean => {
+    const value = hex.get(grid[y][x]) ?? '#ffffff';
+    const [r, g, b] = [1, 3, 5].map((offset) => parseInt(value.slice(offset, offset + 2), 16));
+    return r < 245 || g < 245 || b < 245;
+  };
+
+  const seen = grid.map((row) => row.map(() => false));
+  let subject = 0;
+  let components = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!isSubject(x, y)) continue;
+      subject += 1;
+      if (seen[y][x]) continue;
+      components += 1;
+      const stack: Array<[number, number]> = [[x, y]];
+      seen[y][x] = true;
+      while (stack.length > 0) {
+        const [cx, cy] = stack.pop()!;
+        const neighbors: Array<[number, number]> = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1],
+        ];
+        for (const [nx, ny] of neighbors) {
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          if (seen[ny][nx] || !isSubject(nx, ny)) continue;
+          seen[ny][nx] = true;
+          stack.push([nx, ny]);
+        }
+      }
+    }
+  }
+  return { ratio: subject / (width * height), components };
+}
+
+describe('风格转换流水线', () => {
+  it('风格转换只接收抠出的主体，并输出固定工作尺寸', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+
+    await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'anime' }));
+    await waitForTask(
+      baseUrl,
+      await submit(baseUrl, await redSquarePng(80, 24), {
+        style: 'realistic',
+        settings: { background: 'keep' },
+      }),
+    );
+
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      const meta = await sharp(call.buffer).metadata();
+      expect(meta.width).toBe(STYLE_WORKING_SIZE);
+      expect(meta.height).toBe(STYLE_WORKING_SIZE);
+    }
+    expect(await nonWhiteRatio(calls[0].buffer)).toBeGreaterThan(0.7);
+    expect(await nonWhiteRatio(calls[1].buffer)).toBeLessThan(0.5);
+  });
+
+  it('同一原图同风格换尺寸档不重复转换', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const small = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime', sizeTier: 'small' }));
+    const medium = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'anime', sizeTier: 'medium' }),
+    );
+
+    expect(small.candidates[0].width).toBe(29);
+    expect(medium.candidates[0].width).toBe(58);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('Q 版端到端仍为三候选，尺寸档与色卡档不变，主体不缩水也不碎', async () => {
+    const baseUrl = await startApp();
+    const image = await redCirclePng();
+
+    const styled = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'chibi' }));
+    const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+    expect(styled.candidates).toHaveLength(3);
+    for (const candidate of styled.candidates as Array<any>) {
+      expect(candidate.width).toBe(29);
+      expect(candidate.height).toBe(29);
+      expect(candidate.boardCount).toBe(1);
+      expect(candidate.paletteTier).toBe('basic');
+    }
+    const chibi = gridStats(styled.candidates[0]);
+    const original = gridStats(plain.candidates[0]);
+    expect(chibi.ratio).toBeGreaterThan(original.ratio * 0.9);
+    expect(chibi.components).toBe(1);
   });
 });

@@ -9,7 +9,12 @@ import {
   type AdvancedSettings,
 } from './advanced-settings';
 import { FailureSampleStore, MAX_FAILURE_SAMPLES } from './failure-samples';
-import { ImageDecodeError, decodeImage, encodeImage, generateCandidates } from './generation';
+import {
+  ImageDecodeError,
+  decodeImage,
+  generateCandidates,
+  prepareSubject,
+} from './generation';
 import {
   ExportStore,
   FREE_DAILY_EXPORT_LIMIT,
@@ -43,6 +48,7 @@ import {
   STYLE_LABELS,
   StyleCache,
   createLocalStyleProvider,
+  encodeStyleInput,
   isStyleId,
   listStyleGroups,
   requiresGenerativeModel,
@@ -282,23 +288,25 @@ export function createServer(options: ServerOptions): Server {
     store.markProcessing(taskId);
     try {
       const source = await decodeImage(image);
-      let decoded = source;
+      // 先抠主体：风格转换与出图共用同一份主体图，避免重复裁剪导致结果不一致。
+      let decoded = prepareSubject(source, settings.background);
       if (style !== 'original') {
         const { provider, generative } = providerFor(style);
-        // 风格缓存以原图内容 + 风格 + 算法/模型版本为键：仅改尺寸/色卡/高级设置时直接复用。
-        const cacheKey = styleCacheKey(image, style, provider.version);
+        // 风格缓存以原图内容 + 风格 + 算法/模型版本 + 背景模式为键：
+        // 仅改尺寸/色卡/高级设置时直接复用。
+        const cacheKey = styleCacheKey(image, style, provider.version, settings.background);
         const cached = styleCache.get(cacheKey);
         let styled: StylizedImage;
         if (cached) {
           // 缓存命中的风格图在首次生成时已通过内容安全，无需重复校验。
           styled = cached;
         } else {
-          // 风格转换在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
+          // 风格转换在抠主体之后，按固定工作尺寸执行。
           try {
             styled = await stylizeOnce(
               cacheKey,
               {
-                buffer: await encodeImage(source),
+                buffer: await encodeStyleInput(decoded),
                 contentType: 'image/png',
                 style,
               },
