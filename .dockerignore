@@ -1,0 +1,13 @@
+.git
+.github
+.agents
+.screenshots
+.trae-html-share-packages
+Pindo-main
+pindo-plan
+pindo-smoke
+pindo-miniapp/node_modules
+pindo-miniapp/dist
+pindo-miniapp/.vitest
+*.log
+*.md
