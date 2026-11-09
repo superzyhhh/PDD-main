@@ -53,12 +53,12 @@ async function ensureSession() {
   return sessionToken;
 }
 
-async function generate(arrayBuffer) {
+async function generate(arrayBuffer, options = {}) {
   const token = await ensureSession();
   const header = {
     'content-type': 'application/octet-stream',
-    'x-size-tier': 'small',
-    'x-palette-tier': 'basic',
+    'x-size-tier': options.sizeTier || 'small',
+    'x-palette-tier': options.paletteTier || 'basic',
   };
   if (token) header['x-session-token'] = token;
 

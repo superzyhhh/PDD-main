@@ -1,8 +1,11 @@
 const api = require('../../utils/api');
 const config = require('../../utils/config');
 
-const CELL = 28;
-const THUMB_CELL = 5;
+const THUMB_WIDTH = 145;
+const DETAIL_MAX_PX = 812;
+const MAX_CELL = 28;
+const MIN_CELL_FOR_CODES = 14;
+const PAGE_H_PADDING_RPX = 48;
 const CANDIDATE_LABELS = ['保主体细节', '保色彩层次', '保少色号'];
 
 Page({
@@ -12,6 +15,17 @@ Page({
     message: '',
     canRetry: false,
     taskId: '',
+    sizeTier: 'small',
+    paletteTier: 'basic',
+    sizeOptions: [
+      { id: 'small', label: '小 29×29' },
+      { id: 'medium', label: '中 58×58' },
+      { id: 'large', label: '大 87×87' },
+    ],
+    paletteOptions: [
+      { id: 'basic', label: 'MARD 221' },
+      { id: 'advanced', label: 'MARD 291' },
+    ],
     candidates: [],
     selectedIndex: -1,
     candidate: null,
@@ -21,6 +35,14 @@ Page({
 
   onUnload() {
     this.cancelPoll();
+  },
+
+  selectSize(event) {
+    this.setData({ sizeTier: event.currentTarget.dataset.id });
+  },
+
+  selectPalette(event) {
+    this.setData({ paletteTier: event.currentTarget.dataset.id });
   },
 
   chooseImage() {
@@ -73,7 +95,10 @@ Page({
     });
 
     try {
-      const task = await api.generate(this.imageBuffer);
+      const task = await api.generate(this.imageBuffer, {
+        sizeTier: this.data.sizeTier,
+        paletteTier: this.data.paletteTier,
+      });
       this.setData({
         stage: 'processing',
         statusText: '正在抠主体、配 MARD 色号',
@@ -81,7 +106,12 @@ Page({
       });
       this.poll(task.taskId);
     } catch (error) {
-      this.showError(error.message, error.code === 'network' || error.code === 'internal');
+      const fallback = error.code === 'advanced-not-allowed';
+      if (fallback) this.setData({ paletteTier: 'basic' });
+      this.showError(
+        error.message,
+        fallback || error.code === 'network' || error.code === 'internal',
+      );
     }
   },
 
@@ -128,7 +158,8 @@ Page({
       ...candidate,
       label: CANDIDATE_LABELS[index],
     }));
-    const thumbSize = list[0].width * THUMB_CELL;
+    const thumbCell = Math.max(1, Math.floor(THUMB_WIDTH / list[0].width));
+    const thumbSize = list[0].width * thumbCell;
     this.setData({
       stage: 'preview',
       message: '',
@@ -140,7 +171,7 @@ Page({
       thumbSize,
     });
     wx.nextTick(() => {
-      list.forEach((candidate, index) => this.paint(`#thumb-${index}`, candidate, THUMB_CELL, false));
+      list.forEach((candidate, index) => this.paint(`#thumb-${index}`, candidate, thumbCell, false));
     });
   },
 
@@ -148,12 +179,13 @@ Page({
     const index = Number(event.currentTarget.dataset.index);
     const candidate = this.data.candidates[index];
     if (!candidate) return;
+    const cell = detailCell(candidate);
     this.setData({
       selectedIndex: index,
       candidate,
-      canvasSize: candidate.width * CELL,
+      canvasSize: candidate.width * cell,
     });
-    wx.nextTick(() => this.paint('#pattern', candidate, CELL, true));
+    wx.nextTick(() => this.paint('#pattern', candidate, cell, true));
     this.reportSelection(index, candidate);
   },
 
@@ -203,7 +235,7 @@ Page({
             const hex = colors[code] || '#FFFFFF';
             ctx.fillStyle = hex;
             ctx.fillRect(x * cell, y * cell, cell, cell);
-            if (!showCodes) continue;
+            if (!showCodes || cell < MIN_CELL_FOR_CODES) continue;
             ctx.strokeStyle = 'rgba(0, 0, 0, 0.18)';
             ctx.lineWidth = 1;
             ctx.strokeRect(x * cell + 0.5, y * cell + 0.5, cell - 1, cell - 1);
@@ -236,4 +268,18 @@ function luminance(hex) {
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * 单块板保留可读色号格宽（超出屏幕时横向滚动）；多块板按可用画布宽度铺满，
+ * 格宽过密时 paint 会隐藏格内色号。
+ */
+function detailCell(candidate) {
+  if (candidate.boardCount <= 1) {
+    return Math.min(MAX_CELL, Math.floor(DETAIL_MAX_PX / candidate.width));
+  }
+  const info = wx.getWindowInfo ? wx.getWindowInfo() : wx.getSystemInfoSync();
+  const rpx = (info.windowWidth || 375) / 750;
+  const availableWidth = Math.max(1, Math.floor(info.windowWidth - PAGE_H_PADDING_RPX * rpx));
+  return Math.max(1, Math.floor(availableWidth / candidate.width));
 }

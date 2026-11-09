@@ -20,6 +20,50 @@
   color: #7A6F66;
 }
 
+.option-block {
+  margin: 0 8rpx 24rpx;
+}
+
+.option-title {
+  display: block;
+  margin-bottom: 12rpx;
+  font-size: 26rpx;
+  color: #7A6F66;
+}
+
+.chips {
+  display: flex;
+  flex-direction: row;
+}
+
+.chip {
+  margin-right: 16rpx;
+  padding: 12rpx 24rpx;
+  border: 2rpx solid #E6DED4;
+  border-radius: 999rpx;
+  background: #FFFFFF;
+  font-size: 24rpx;
+  color: #2B2622;
+}
+
+.chip.active {
+  border-color: #2B2622;
+  background: #2B2622;
+  color: #FFFFFF;
+}
+
+.notice {
+  display: block;
+  padding: 0 8rpx 12rpx;
+  font-size: 22rpx;
+  line-height: 1.5;
+  color: #9A8F85;
+}
+
+.notice-advanced {
+  color: #A15C2B;
+}
+
 .dropzone {
   margin: 40rpx 0;
   padding: 96rpx 32rpx;

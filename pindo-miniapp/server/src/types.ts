@@ -1,4 +1,10 @@
-export type PaletteTier = 'basic' | 'advanced';
+export const PALETTE_TIERS = ['basic', 'advanced'] as const;
+
+export type PaletteTier = (typeof PALETTE_TIERS)[number];
+
+export const SIZE_TIERS = ['small', 'medium', 'large'] as const;
+
+export type SizeTier = (typeof SIZE_TIERS)[number];
 
 export interface CandidateColor {
   code: string;
@@ -21,6 +27,8 @@ export interface Candidate {
   id: CandidateId;
   width: number;
   height: number;
+  /** 拼板数，按 29 格一块板换算。 */
+  boardCount: number;
   paletteTier: PaletteTier;
   /** 色号矩阵，行优先。 */
   grid: string[][];

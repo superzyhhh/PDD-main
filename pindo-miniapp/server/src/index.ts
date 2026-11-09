@@ -20,6 +20,19 @@ if (!appId || !appSecret) {
 
 const session = createSessionService({ appId, appSecret });
 
-createServer({ moderation, session }).listen(port, () => {
+// 291 进阶档白名单：逗号分隔的 openId。未配置时全部拒绝（会员体系见工单 05）。
+const advancedOpenIds = (process.env.ADVANCED_PALETTE_OPENIDS ?? '')
+  .split(',')
+  .map((openId) => openId.trim())
+  .filter(Boolean);
+
+if (advancedOpenIds.length === 0) {
+  console.warn('[pindo-miniapp] 未配置 ADVANCED_PALETTE_OPENIDS，291 进阶档将对所有账号关闭');
+}
+
+const isAdvancedPaletteAllowed = (openId?: string): boolean =>
+  !!openId && advancedOpenIds.includes(openId);
+
+createServer({ moderation, session, isAdvancedPaletteAllowed }).listen(port, () => {
   console.log(`[pindo-miniapp] server listening on :${port}`);
 });

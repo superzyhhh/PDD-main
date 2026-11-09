@@ -5,14 +5,25 @@ import { applyDithering } from './vendor/pindo-engine/dithering';
 import { cropToSubject } from './vendor/pindo-engine/subject-crop';
 import { buildUsageMap, limitPaletteWithKeyColors } from './vendor/pindo-engine/palette-limit';
 import type { CompiledBeadColor, DitheringMode } from './vendor/pindo-engine/types';
-import { CANDIDATE_IDS, type Candidate, type CandidateId } from './types';
+import {
+  CANDIDATE_IDS,
+  type Candidate,
+  type CandidateId,
+  type PaletteTier,
+  type SizeTier,
+} from './types';
 
-export const GRID_SIZE = 29;
+/** 拼板规格统一按 29 格一块板。 */
+export const BOARD_SIZE = 29;
+
+/** 成品尺寸档：小 29×29（1 块板）、中 58×58（4 块）、大 87×87（9 块）。 */
+export const SIZE_TIER_GRID: Record<SizeTier, number> = {
+  small: BOARD_SIZE,
+  medium: BOARD_SIZE * 2,
+  large: BOARD_SIZE * 3,
+};
 
 const MAX_INPUT_PIXELS = 4096 * 4096;
-
-/** 基础档 221：保主体细节的色号上限即档位上限。 */
-const BASIC_TIER_COLOR_CAP = 221;
 
 interface CandidateStrategy {
   id: CandidateId;
@@ -21,22 +32,31 @@ interface CandidateStrategy {
   maxColors: number;
 }
 
+type StrategyParams = Omit<CandidateStrategy, 'id'>;
+
 /**
  * 三候选由既有引擎参数组合而成，顺序来自 CANDIDATE_IDS（规格「三候选策略」）。
  * 保主体细节：边缘感知降采样 + 抖动 + 放开到档位上限；
  * 保色彩层次：平均降采样 + 抖动 + 中等色号数；
  * 保少色号：平均降采样 + 关闭抖动 + 低色号数。
  */
-const STRATEGY_PARAMS: Record<CandidateId, Omit<CandidateStrategy, 'id'>> = {
-  detail: { downscale: 'edge-aware', dithering: 'floyd-steinberg', maxColors: BASIC_TIER_COLOR_CAP },
+const STRATEGY_PARAMS: Record<CandidateId, StrategyParams> = {
+  detail: { downscale: 'edge-aware', dithering: 'floyd-steinberg', maxColors: Number.POSITIVE_INFINITY },
   color: { downscale: 'average', dithering: 'floyd-steinberg', maxColors: 64 },
   few: { downscale: 'average', dithering: 'none', maxColors: 24 },
 };
 
-const CANDIDATE_STRATEGIES: readonly CandidateStrategy[] = CANDIDATE_IDS.map((id) => ({
-  id,
-  ...STRATEGY_PARAMS[id],
-}));
+export interface GenerationOptions {
+  sizeTier: SizeTier;
+  paletteTier: PaletteTier;
+}
+
+/** 一张图纸的格网规格：格宽、拼板数与所属色卡档位。 */
+interface GridSpec {
+  gridSize: number;
+  boardCount: number;
+  paletteTier: PaletteTier;
+}
 
 export type DecodeFailure = 'unsupported' | 'too-large';
 
@@ -74,26 +94,40 @@ export async function decodeImage(buffer: Buffer): Promise<DecodedImage> {
 }
 
 /**
- * 抠主体一次，按三套策略各出一张 29×29 图纸；返回值顺序即展示顺序。
+ * 抠主体一次，按尺寸档与色卡档、三套策略各出一张图纸；返回值顺序即展示顺序。
  */
-export function generateCandidates(image: DecodedImage, palette: CompiledBeadColor[]): Candidate[] {
+export function generateCandidates(
+  image: DecodedImage,
+  palette: CompiledBeadColor[],
+  options: GenerationOptions,
+): Candidate[] {
+  const gridSize = SIZE_TIER_GRID[options.sizeTier];
+  const spec: GridSpec = {
+    gridSize,
+    boardCount: (gridSize / BOARD_SIZE) ** 2,
+    paletteTier: options.paletteTier,
+  };
   const cropped = cropToSubject(image.data, image.width, image.height, { background: 'white' });
-  return CANDIDATE_STRATEGIES.map((strategy) => buildCandidate(cropped, palette, strategy));
+
+  return CANDIDATE_IDS.map((id) => {
+    const strategy: CandidateStrategy = {
+      id,
+      ...STRATEGY_PARAMS[id],
+      // 档位上限即基础/进阶色卡的总数，任何策略都不得突破。
+      maxColors: Math.min(STRATEGY_PARAMS[id].maxColors, palette.length),
+    };
+    return buildCandidate(cropped, palette, strategy, spec);
+  });
 }
 
 function buildCandidate(
   cropped: { data: Uint8ClampedArray; width: number; height: number },
   palette: CompiledBeadColor[],
   strategy: CandidateStrategy,
+  spec: GridSpec,
 ): Candidate {
-  const pixels = downscale(
-    cropped.data,
-    cropped.width,
-    cropped.height,
-    GRID_SIZE,
-    GRID_SIZE,
-    strategy.downscale,
-  );
+  const { gridSize, boardCount, paletteTier } = spec;
+  const pixels = downscale(cropped.data, cropped.width, cropped.height, gridSize, gridSize, strategy.downscale);
 
   // 先用完整色卡统计用量，再按策略压到目标色号数；色号上限不会突破档位。
   const targetPalette =
@@ -106,15 +140,15 @@ function buildCandidate(
     const color = matchColor(pixel, targetPalette);
     return { r: color.rgb[0], g: color.rgb[1], b: color.rgb[2] };
   };
-  const dithered = applyDithering(pixels, GRID_SIZE, GRID_SIZE, strategy.dithering, nearest);
+  const dithered = applyDithering(pixels, gridSize, gridSize, strategy.dithering, nearest);
   const matched = matchColors(dithered, targetPalette);
 
   const grid: string[][] = [];
   const usage = new Map<string, number>();
-  for (let y = 0; y < GRID_SIZE; y++) {
+  for (let y = 0; y < gridSize; y++) {
     const row: string[] = [];
-    for (let x = 0; x < GRID_SIZE; x++) {
-      const color = matched[y * GRID_SIZE + x];
+    for (let x = 0; x < gridSize; x++) {
+      const color = matched[y * gridSize + x];
       row.push(color.code);
       usage.set(color.code, (usage.get(color.code) ?? 0) + 1);
     }
@@ -129,9 +163,10 @@ function buildCandidate(
 
   return {
     id: strategy.id,
-    width: GRID_SIZE,
-    height: GRID_SIZE,
-    paletteTier: 'basic',
+    width: gridSize,
+    height: gridSize,
+    boardCount,
+    paletteTier,
     grid,
     usage: usedCodes.map((code) => ({ code, count: usage.get(code)! })),
     colors,

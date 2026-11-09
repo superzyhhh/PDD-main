@@ -6,8 +6,11 @@ import { createServer } from '../src/server';
 import type { Moderation } from '../src/moderation';
 import type { Logger } from '../src/logger';
 import mardPalette from '../src/data/mard.json';
+import { getAdvancedPalette } from '../src/palette';
+import type { PaletteTier, SizeTier } from '../src/types';
 
 const BASE_CODE = /^(?:[A-H]|M)\d{2}$/;
+const ADVANCED_CODES = new Set(getAdvancedPalette().map((color) => color.code));
 
 const allowAll: Moderation = { check: async () => 'pass' };
 
@@ -20,8 +23,12 @@ afterEach(async () => {
   }
 });
 
-async function startApp(moderation: Moderation = allowAll, logger?: Logger): Promise<string> {
-  server = createServer({ moderation, logger });
+async function startApp(
+  moderation: Moderation = allowAll,
+  logger?: Logger,
+  isAdvancedPaletteAllowed?: (openId?: string) => boolean,
+): Promise<string> {
+  server = createServer({ moderation, logger, isAdvancedPaletteAllowed });
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
@@ -56,20 +63,28 @@ async function gradientPng(size = 256): Promise<Buffer> {
   return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
 }
 
-function upload(baseUrl: string, image: Buffer): Promise<Response> {
+interface UploadOptions {
+  sizeTier?: SizeTier;
+  paletteTier?: PaletteTier;
+  token?: string;
+}
+
+function upload(baseUrl: string, image: Buffer, options: UploadOptions = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/octet-stream',
+    'x-size-tier': options.sizeTier ?? 'small',
+    'x-palette-tier': options.paletteTier ?? 'basic',
+  };
+  if (options.token) headers['x-session-token'] = options.token;
   return fetch(`${baseUrl}/api/generate`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/octet-stream',
-      'x-size-tier': 'small',
-      'x-palette-tier': 'basic',
-    },
+    headers,
     body: image,
   });
 }
 
-async function submit(baseUrl: string, image: Buffer): Promise<string> {
-  const response = await upload(baseUrl, image);
+async function submit(baseUrl: string, image: Buffer, options: UploadOptions = {}): Promise<string> {
+  const response = await upload(baseUrl, image, options);
   expect(response.status).toBe(202);
   const body = (await response.json()) as { taskId: string };
   expect(body.taskId).toBeTruthy();
@@ -185,6 +200,53 @@ describe('云端生成接口', () => {
       candidates.map((item) => (item.usage as Array<{ code: string }>).map((entry) => entry.code).join(',')),
     );
     expect(signatures.size).toBe(3);
+  });
+
+  it('小/中/大成品尺寸档的格网与拼板数正确', async () => {
+    const baseUrl = await startApp();
+    const image = await redSquarePng();
+
+    const cases = [
+      { sizeTier: 'small' as const, grid: 29, boards: 1 },
+      { sizeTier: 'medium' as const, grid: 58, boards: 4 },
+      { sizeTier: 'large' as const, grid: 87, boards: 9 },
+    ];
+    for (const item of cases) {
+      const task = await waitForTask(baseUrl, await submit(baseUrl, image, { sizeTier: item.sizeTier }));
+      expect(task.status).toBe('completed');
+      const candidate = task.candidates[0];
+      expect(candidate.width).toBe(item.grid);
+      expect(candidate.height).toBe(item.grid);
+      expect(candidate.boardCount).toBe(item.boards);
+
+      const usage = candidate.usage as Array<{ count: number }>;
+      expect(usage.reduce((sum, entry) => sum + entry.count, 0)).toBe(item.grid * item.grid);
+    }
+  });
+
+  it('291 档在白名单外被服务端拒绝，提示可理解', async () => {
+    const baseUrl = await startApp();
+    const response = await upload(baseUrl, await redSquarePng(), { paletteTier: 'advanced' });
+
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('advanced-not-allowed');
+    expect(body.error.message).toContain('291');
+  });
+
+  it('291 档白名单内出图，且全部色号落在 291 内', async () => {
+    expect(ADVANCED_CODES.size).toBe(291);
+    const baseUrl = await startApp(allowAll, undefined, () => true);
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { paletteTier: 'advanced' }));
+
+    expect(task.status).toBe('completed');
+    for (const candidate of task.candidates as Array<any>) {
+      expect(candidate.paletteTier).toBe('advanced');
+      const codes = (candidate.grid as string[][]).flat();
+      for (const code of codes) {
+        expect(ADVANCED_CODES.has(code)).toBe(true);
+      }
+    }
   });
 
   it('命中内容安全时阻断任务，返回换图提示并留痕', async () => {

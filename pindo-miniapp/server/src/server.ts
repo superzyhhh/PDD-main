@@ -4,20 +4,26 @@ import { parseAnalyticsEvent } from './analytics';
 import { ImageDecodeError, decodeImage, generateCandidates } from './generation';
 import { consoleLogger, type Logger } from './logger';
 import type { Moderation } from './moderation';
-import { getBasicPalette } from './palette';
+import { getAdvancedPalette, getBasicPalette } from './palette';
 import { createSessionService, type SessionService } from './session';
 import { TaskStore } from './store';
-import type { TaskFailureCode } from './types';
+import {
+  PALETTE_TIERS,
+  SIZE_TIERS,
+  type PaletteTier,
+  type SizeTier,
+  type TaskFailureCode,
+} from './types';
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const SUPPORTED_SIZE_TIER = 'small';
-const SUPPORTED_PALETTE_TIER = 'basic';
 
 export interface ServerOptions {
   /** 必填：内容安全校验不能有默认放行路径。 */
   moderation: Moderation;
   logger?: Logger;
   session?: SessionService;
+  /** 291 进阶档白名单；缺省为全部拒绝。 */
+  isAdvancedPaletteAllowed?: (openId?: string) => boolean;
 }
 
 class BodyTooLargeError extends Error {}
@@ -73,13 +79,16 @@ export function createServer(options: ServerOptions): Server {
   const logger = options.logger ?? consoleLogger;
   const session = options.session ?? createSessionService();
   const store = new TaskStore();
-  const palette = getBasicPalette();
+  const basicPalette = getBasicPalette();
+  const advancedPalette = getAdvancedPalette();
+  const isAdvancedPaletteAllowed = options.isAdvancedPaletteAllowed ?? (() => false);
 
-  async function runTask(taskId: string, image: Buffer): Promise<void> {
+  async function runTask(taskId: string, image: Buffer, sizeTier: SizeTier, paletteTier: PaletteTier): Promise<void> {
     store.markProcessing(taskId);
     try {
       const decoded = await decodeImage(image);
-      store.complete(taskId, generateCandidates(decoded, palette));
+      const palette = paletteTier === 'advanced' ? advancedPalette : basicPalette;
+      store.complete(taskId, generateCandidates(decoded, palette, { sizeTier, paletteTier }));
     } catch (error) {
       const failure = failureFor(error);
       if (failure.code === 'internal') {
@@ -156,10 +165,17 @@ export function createServer(options: ServerOptions): Server {
   }
 
   async function handleGenerate(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const sizeTier = String(req.headers['x-size-tier'] ?? 'small');
-    const paletteTier = String(req.headers['x-palette-tier'] ?? 'basic');
-    if (sizeTier !== SUPPORTED_SIZE_TIER || paletteTier !== SUPPORTED_PALETTE_TIER) {
+    const sizeTier = String(req.headers['x-size-tier'] ?? 'small') as SizeTier;
+    const paletteTier = String(req.headers['x-palette-tier'] ?? 'basic') as PaletteTier;
+    if (!SIZE_TIERS.includes(sizeTier) || !PALETTE_TIERS.includes(paletteTier)) {
       sendError(res, 400, 'unsupported-option', '当前版本暂不支持该尺寸或色号档位');
+      return;
+    }
+
+    const token = String(req.headers['x-session-token'] ?? '');
+    const openId = token ? session.openIdFor(token) : undefined;
+    if (paletteTier === 'advanced' && !isAdvancedPaletteAllowed(openId)) {
+      sendError(res, 403, 'advanced-not-allowed', '291 进阶色卡仅对已开通会员开放');
       return;
     }
 
@@ -216,11 +232,9 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const token = String(req.headers['x-session-token'] ?? '');
-    const openId = token ? session.openIdFor(token) : undefined;
     const task = store.create(key, openId);
     sendJson(res, 202, { taskId: task.id, status: task.status });
-    setImmediate(() => void runTask(task.id, image));
+    setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier));
   }
 
   return createHttpServer(async (req, res) => {
