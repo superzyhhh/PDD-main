@@ -30,7 +30,13 @@ async function startApp(options: Partial<ServerOptions> = {}): Promise<string> {
     await new Promise<void>((resolve) => server!.close(() => resolve()));
     server = undefined;
   }
-  server = createServer({ moderation: allowAll, now: () => new Date(clock), ...options });
+  server = createServer({
+    moderation: allowAll,
+    now: () => new Date(clock),
+    // 看板用例关注统计口径，显式放开高级风格白名单。
+    isAdvancedStyleAllowed: () => true,
+    ...options,
+  });
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
@@ -388,7 +394,7 @@ describe('埋点与验证看板', () => {
       available: true,
       version: 'flaky-v1',
       async stylize(input) {
-        if (input.style === 'chibi') throw new Error('provider down');
+        if (input.style === 'realistic') throw new Error('provider down');
         return base.stylize(input);
       },
     };
@@ -397,7 +403,7 @@ describe('埋点与验证看板', () => {
     const token = await login(baseUrl, 'style-failure');
 
     await generate(baseUrl, token, 'xiaohongshu', 0, 'anime');
-    const failed = await generate(baseUrl, token, 'xiaohongshu', 1, 'chibi');
+    const failed = await generate(baseUrl, token, 'xiaohongshu', 1, 'realistic');
     expect(failed.status).toBe('failed');
     expect(failed.failure.code).toBe('style-failed');
 
@@ -406,26 +412,26 @@ describe('埋点与验证看板', () => {
       generation: { tasks: 1, users: 1 },
       styleFailure: { count: 0, rate: 0 },
     });
-    expect(styleEntry(xhs, 'chibi')).toMatchObject({
+    expect(styleEntry(xhs, 'realistic')).toMatchObject({
       generation: { tasks: 0, users: 0 },
       styleFailure: { count: 1, rate: 1 },
     });
 
     const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
-    expect(styleEntry(douyin, 'chibi')).toMatchObject({ styleFailure: { count: 0, rate: null } });
+    expect(styleEntry(douyin, 'realistic')).toMatchObject({ styleFailure: { count: 0, rate: null } });
 
     // 时间与渠道同时生效时仍按风格统计失败。
     const combined = await summary(baseUrl, adminToken, {
       channel: 'xiaohongshu',
       from: new Date(clock - 60_000),
     });
-    expect(styleEntry(combined, 'chibi')).toMatchObject({ styleFailure: { count: 1, rate: 1 } });
+    expect(styleEntry(combined, 'realistic')).toMatchObject({ styleFailure: { count: 1, rate: 1 } });
 
     // 同一任务重复上报只计一次。
     const store = new MetricsStore();
-    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'chibi', at: clock });
-    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'chibi', at: clock });
-    expect(styleEntry(store.summary(), 'chibi')!.styleFailure.count).toBe(1);
+    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
+    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
+    expect(styleEntry(store.summary(), 'realistic')!.styleFailure.count).toBe(1);
   });
 
   it('风格化内容不合规按独立失败原因结束，不混入风格化失败次数', async () => {

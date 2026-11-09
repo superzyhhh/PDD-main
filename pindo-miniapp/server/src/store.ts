@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
 import { DEFAULT_CHANNEL } from './metrics';
-import { DEFAULT_STYLE, STYLE_LABELS, type StyleId } from './style';
+import { DEFAULT_STYLE, STYLE_LABELS, requiresGenerativeModel, type StyleId } from './style';
 import type {
   Candidate,
   PaletteTier,
@@ -139,6 +139,7 @@ export class TaskStore {
     if (record.style) {
       view.style = record.style;
       view.styleLabel = STYLE_LABELS[record.style];
+      view.aiStyled = requiresGenerativeModel(record.style);
     }
     return view;
   }

@@ -51,8 +51,7 @@ Page({
     sizeTier: 'small',
     paletteTier: 'basic',
     style: 'original',
-    styleAvailable: false,
-    styleOptions: [],
+    styleGroups: [],
     styleLabel: '',
     aiStyled: false,
     advancedOpen: false,
@@ -151,21 +150,24 @@ Page({
     wx.navigateTo({ url: '/pages/patterns/patterns' });
   },
 
-  /** 风格族可用性与选项由权益接口下发；不可用时隐藏整组入口。 */
+  /** 风格族按层级由权益接口下发：免费风格始终有，高级风格只在被授权时出现。 */
   async loadStyles() {
     try {
       const info = await api.getMembership(isIOS() ? 'ios' : 'android');
       const styles = info && info.styles;
-      const options =
-        styles && styles.available && Array.isArray(styles.options) ? styles.options : [];
+      const groups = styles && Array.isArray(styles.groups) ? styles.groups : [];
+      const ids = groups.reduce(
+        (all, group) => all.concat((group.options || []).map((item) => item.id)),
+        [],
+      );
       this.setData({
-        styleAvailable: options.length > 0,
-        styleOptions: options,
-        // 入口关闭时回落到原图，避免带着不可用的风格提交。
-        style: options.some((item) => item.id === this.data.style) ? this.data.style : 'original',
+        styleGroups: groups,
+        // 入口变化时回落到原图，避免带着不可用的风格提交。
+        style: ids.indexOf(this.data.style) >= 0 ? this.data.style : 'original',
       });
     } catch {
-      this.setData({ styleAvailable: false, styleOptions: [], style: 'original' });
+      // 拉取失败时保留已有分组：免费风格不能因为一次请求失败就被隐藏。
+      this.setData({ style: 'original' });
     }
   },
 
@@ -204,7 +206,7 @@ Page({
         previewHint: REOPEN_HINT,
         // 快照可能因任务淘汰而没有风格信息，此时不展示风格标识。
         styleLabel: result.pattern.styleLabel || '',
-        aiStyled: !!result.pattern.style && result.pattern.style !== 'original',
+        aiStyled: !!result.pattern.aiStyled,
         candidates: [labeled],
         selectedIndex: 0,
         candidate: labeled,
@@ -392,10 +394,11 @@ Page({
           seriesOptions: seriesOptionsFor(advanced.series, 'basic'),
         });
       }
-      // 风格入口被服务端判定不可用时回落到原图并隐藏，下次生成仍可继续。
-      const styleFallback = error.code === 'style-unavailable';
+      // 风格被服务端判定不可用或未授权时回落到原图，并重新拉取分组隐藏该入口。
+      const styleFallback = error.code === 'style-unavailable' || error.code === 'style-forbidden';
       if (styleFallback) {
-        this.setData({ style: 'original', styleAvailable: false, styleOptions: [] });
+        this.setData({ style: 'original' });
+        this.loadStyles();
       }
       this.showError(
         error.message,
@@ -468,7 +471,7 @@ Page({
       previewHint: DEFAULT_PICK_HINT,
       style,
       styleLabel: task.styleLabel || '',
-      aiStyled: style !== 'original',
+      aiStyled: !!task.aiStyled,
       candidates: list,
       selectedIndex: -1,
       candidate: null,

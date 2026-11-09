@@ -78,10 +78,12 @@ export interface TaskView {
   savedPattern?: SavedPattern;
   /** 本次生成实际应用的高级设置，用于客户端明确反馈。 */
   settings?: AdvancedSettings;
-  /** 本次生成实际使用的风格；非原图表示经过了风格服务。 */
+  /** 本次生成实际使用的风格；非原图表示经过了风格转换。 */
   style?: StyleId;
-  /** 风格的展示文案，与风格选项共用同一份服务端标签。 */
+  /** 展示名，供客户端直接回显。 */
   styleLabel?: string;
+  /** 是否由生成式模型产出，决定是否展示 AI 标识。 */
+  aiStyled?: boolean;
 }
 
 /** 「我的图纸」保存结果；evictedCount 用于提示用户旧图已被清理。 */

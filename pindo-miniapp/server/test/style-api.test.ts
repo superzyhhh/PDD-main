@@ -23,7 +23,12 @@ afterEach(async () => {
 });
 
 async function startApp(options: Partial<ServerOptions> = {}): Promise<string> {
-  server = createServer({ moderation: allowAll, ...options });
+  server = createServer({
+    moderation: allowAll,
+    // 多数用例验证生成行为而非授权，显式放开白名单；授权用例自身覆盖该参数。
+    isAdvancedStyleAllowed: () => true,
+    ...options,
+  });
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
@@ -121,7 +126,7 @@ describe('风格族选择与风格服务骨架', () => {
     expect(body.error.message).toContain('风格');
   });
 
-  it('未配置风格服务时选择风格返回明确的不可用提示', async () => {
+  it('未配置生成式服务时选择高级风格返回明确的不可用提示', async () => {
     const baseUrl = await startApp();
 
     const response = await upload(baseUrl, await redSquarePng(), { style: 'anime' });
@@ -129,7 +134,29 @@ describe('风格族选择与风格服务骨架', () => {
     expect(response.status).toBe(503);
     const body = (await response.json()) as { error: { code: string; message: string } };
     expect(body.error.code).toBe('style-unavailable');
-    expect(body.error.message).toContain('风格化');
+    expect(body.error.message).toContain('高级风格');
+  });
+
+  it('免费风格不依赖生成式服务，未配置时仍能完成转换且不标记 AI', async () => {
+    const baseUrl = await startApp();
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'chibi' }));
+
+    expect(task.status).toBe('completed');
+    expect(task.style).toBe('chibi');
+    expect(task.aiStyled).toBe(false);
+    expect(task.candidates).toHaveLength(3);
+  });
+
+  it('免费风格由本地算法完成，不调用生成式服务', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'line' }));
+
+    expect(task.status).toBe('completed');
+    expect(task.style).toBe('line');
+    expect(calls).toHaveLength(0);
   });
 
   it('非原图风格先生成风格图再出图，仍恰好三候选且尺寸与色卡规则不变', async () => {
@@ -142,6 +169,7 @@ describe('风格族选择与风格服务骨架', () => {
     expect(task.status).toBe('completed');
     expect(task.style).toBe('anime');
     expect(task.styleLabel).toBe('动漫风');
+    expect(task.aiStyled).toBe(true);
     expect(task.candidates).toHaveLength(3);
     expect(task.candidates.map((item: any) => item.id)).toEqual(['detail', 'color', 'few']);
     for (const candidate of task.candidates as Array<any>) {
@@ -191,29 +219,82 @@ describe('风格族选择与风格服务骨架', () => {
     expect(checks).toBe(2);
   });
 
-  it('权益接口下发风格可用性与可选项', async () => {
+  it('权益接口按层级下发免费风格与高级风格', async () => {
     const baseUrl = await startApp({ style: createFakeStyleProvider() });
 
     const response = await fetch(`${baseUrl}/api/membership`, { headers: { 'x-platform': 'android' } });
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      styles: { available: boolean; options: Array<{ id: string; label: string }> };
+      styles: {
+        groups: Array<{
+          group: string;
+          label: string;
+          options: Array<{
+            id: string;
+            label: string;
+            group: string;
+            requiresGenerativeModel: boolean;
+          }>;
+        }>;
+      };
     };
-    expect(body.styles.available).toBe(true);
-    expect(body.styles.options.map((item) => item.id)).toEqual([...STYLE_IDS]);
-    for (const option of body.styles.options) expect(option.label).toBeTruthy();
+    expect(body.styles.groups.map((group) => group.group)).toEqual(['free', 'advanced']);
+    expect(body.styles.groups[0].options.map((item) => item.id)).toEqual([
+      'original',
+      'chibi',
+      'line',
+      'flat',
+      'pixel',
+    ]);
+    expect(body.styles.groups[1].options.map((item) => item.id)).toEqual(['anime', 'realistic']);
+    for (const group of body.styles.groups) {
+      expect(group.label).toBeTruthy();
+      for (const option of group.options) {
+        expect(option.label).toBeTruthy();
+        expect(option.group).toBe(group.group);
+        expect(option.requiresGenerativeModel).toBe(group.group === 'advanced');
+      }
+    }
+    const allIds = body.styles.groups.reduce<string[]>(
+      (all, group) => all.concat(group.options.map((item) => item.id)),
+      [],
+    );
+    expect(allIds.slice().sort()).toEqual([...STYLE_IDS].sort());
   });
 
-  it('权益接口在未配置风格服务时标记不可用且不给选项', async () => {
+  it('权益接口在未配置生成式服务时只下发免费风格', async () => {
     const baseUrl = await startApp();
 
     const response = await fetch(`${baseUrl}/api/membership`, { headers: { 'x-platform': 'android' } });
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      styles: { available: boolean; options: Array<{ id: string }> };
+      styles: { groups: Array<{ group: string; options: Array<{ id: string }> }> };
     };
-    expect(body.styles.available).toBe(false);
-    expect(body.styles.options).toEqual([]);
+    expect(body.styles.groups.map((group) => group.group)).toEqual(['free']);
+    expect(body.styles.groups[0].options.map((item) => item.id)).toEqual([
+      'original',
+      'chibi',
+      'line',
+      'flat',
+      'pixel',
+    ]);
+  });
+
+  it('未授权时高级风格不下发且提交被拒绝', async () => {
+    const baseUrl = await startApp({
+      style: createFakeStyleProvider(),
+      isAdvancedStyleAllowed: () => false,
+    });
+
+    const info = (await (
+      await fetch(`${baseUrl}/api/membership`, { headers: { 'x-platform': 'android' } })
+    ).json()) as { styles: { groups: Array<{ group: string }> } };
+    expect(info.styles.groups.map((group) => group.group)).toEqual(['free']);
+
+    const response = await upload(baseUrl, await redSquarePng(), { style: 'anime' });
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('style-forbidden');
   });
 });
 
@@ -355,13 +436,13 @@ describe('风格缓存与失败降级', () => {
 
     const animeId = await submit(baseUrl, image, { style: 'anime' });
     const anime = await waitForTask(baseUrl, animeId);
-    const chibiId = await submit(baseUrl, image, { style: 'chibi' });
-    const chibi = await waitForTask(baseUrl, chibiId);
+    const realisticId = await submit(baseUrl, image, { style: 'realistic' });
+    const realistic = await waitForTask(baseUrl, realisticId);
 
-    expect(animeId).not.toBe(chibiId);
+    expect(animeId).not.toBe(realisticId);
     expect(anime.style).toBe('anime');
-    expect(chibi.style).toBe('chibi');
-    expect(calls.map((call) => call.style)).toEqual(['anime', 'chibi']);
+    expect(realistic.style).toBe('realistic');
+    expect(calls.map((call) => call.style)).toEqual(['anime', 'realistic']);
   });
 
   it('风格服务超时后任务以风格化失败结束且不产出候选', async () => {

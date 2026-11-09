@@ -40,10 +40,12 @@ import { MAX_SHARES, SHARE_SOURCES, ShareStore, type ShareRecord, type ShareSour
 import {
   DEFAULT_STYLE,
   DEFAULT_STYLE_TIMEOUT_MS,
-  STYLE_IDS,
   STYLE_LABELS,
   StyleCache,
+  createLocalStyleProvider,
   isStyleId,
+  listStyleGroups,
+  requiresGenerativeModel,
   styleCacheKey,
   unconfiguredStyleProvider,
   type StyleId,
@@ -71,8 +73,10 @@ export interface ServerOptions {
   session?: SessionService;
   /** 支付渠道；缺省为未配置，客户端只能看到权益、不能下单。 */
   payment?: PaymentProvider;
-  /** 风格服务；缺省为未配置，风格化能力关闭，原图流程不变。 */
+  /** 风格服务；缺省为未配置，高级风格关闭，免费风格仍由本地算法完成。 */
   style?: StyleProvider;
+  /** 高级风格白名单（内测期）；未提供时只按生成式服务是否已配置判定。 */
+  isAdvancedStyleAllowed?: (openId?: string) => boolean;
   /** 测试注入时钟；缺省用系统时间。 */
   now?: () => Date;
   /** 291 进阶档的额外白名单（运营/测试用）；会员资格由服务端会员状态判定。 */
@@ -160,6 +164,8 @@ export function createServer(options: ServerOptions): Server {
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   const styleProvider = options.style ?? unconfiguredStyleProvider;
+  /** 免费风格不依赖外部服务，任何配置下都可用。 */
+  const freeStyleProvider = createLocalStyleProvider();
   const styleCache = new StyleCache();
   /** 同一张原图同一种风格的并发请求合并成一次调用，避免重复计费。 */
   const pendingStyles = new Map<string, Promise<StylizedImage>>();
@@ -179,6 +185,13 @@ export function createServer(options: ServerOptions): Server {
   /** 291 档位以服务端会员状态为准，额外白名单只用于运营/测试。 */
   function isAdvancedPaletteAllowed(openId?: string): boolean {
     return extraAdvancedAllow(openId) || memberships.isMember(openId, now());
+  }
+
+  /** 高级风格以生成式服务可用为前提，再按内测白名单或会员身份放行。 */
+  function isAdvancedStyleAllowed(openId?: string): boolean {
+    if (!styleProvider.available) return false;
+    const extra = options.isAdvancedStyleAllowed;
+    return (extra ? extra(openId) : false) || memberships.isMember(openId, now());
   }
 
   /** 把图纸快照存入「我的图纸」，并把淘汰数量挂回任务，供客户端提示。 */
@@ -242,11 +255,24 @@ export function createServer(options: ServerOptions): Server {
     }
   }
 
-  /** 缓存未命中时合并同键并发请求，缓存命中则不再调用风格服务。 */
-  function stylizeOnce(cacheKey: string, input: StyleInput): Promise<StylizedImage> {
+  /** 按风格目录选择实现：免费风格走本地算法，高级风格走生成式服务。 */
+  function providerFor(style: StyleId): { provider: StyleProvider; generative: boolean } {
+    const generative = requiresGenerativeModel(style);
+    return { provider: generative ? styleProvider : freeStyleProvider, generative };
+  }
+
+  function stylizeOnce(
+    cacheKey: string,
+    input: StyleInput,
+    provider: StyleProvider,
+    generative: boolean,
+  ): Promise<StylizedImage> {
     const pending = pendingStyles.get(cacheKey);
     if (pending) return pending;
-    const request = stylizeWithTimeout(input).finally(() => pendingStyles.delete(cacheKey));
+    // 免费风格在本地同步完成，只有依赖外部模型的风格需要超时与取消。
+    const request = (
+      generative ? stylizeWithTimeout(input) : provider.stylize(input)
+    ).finally(() => pendingStyles.delete(cacheKey));
     pendingStyles.set(cacheKey, request);
     return request;
   }
@@ -258,21 +284,27 @@ export function createServer(options: ServerOptions): Server {
       const source = await decodeImage(image);
       let decoded = source;
       if (style !== 'original') {
-        // 风格缓存以原图内容 + 风格 + 模型版本为键：仅改尺寸/色卡/高级设置时直接复用。
-        const cacheKey = styleCacheKey(image, style, styleProvider.version);
+        const { provider, generative } = providerFor(style);
+        // 风格缓存以原图内容 + 风格 + 算法/模型版本为键：仅改尺寸/色卡/高级设置时直接复用。
+        const cacheKey = styleCacheKey(image, style, provider.version);
         const cached = styleCache.get(cacheKey);
         let styled: StylizedImage;
         if (cached) {
           // 缓存命中的风格图在首次生成时已通过内容安全，无需重复校验。
           styled = cached;
         } else {
-          // 风格化在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
+          // 风格转换在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
           try {
-            styled = await stylizeOnce(cacheKey, {
-              buffer: await encodeImage(source),
-              contentType: 'image/png',
-              style,
-            });
+            styled = await stylizeOnce(
+              cacheKey,
+              {
+                buffer: await encodeImage(source),
+                contentType: 'image/png',
+                style,
+              },
+              provider,
+              generative,
+            );
           } catch (error) {
             failStyle(taskId, style, 'provider', error);
             return;
@@ -429,10 +461,6 @@ export function createServer(options: ServerOptions): Server {
     const openId = requestOpenId(req);
     const status = openId ? memberships.statusOf(openId, now()) : undefined;
     const purchaseAvailable = !isIOSPlatform(req) && payment.available;
-    // 风格族是否可用与可选项由服务端下发，不可用时客户端隐藏整组入口。
-    const styleOptions = styleProvider.available
-      ? STYLE_IDS.map((id) => ({ id, label: STYLE_LABELS[id] }))
-      : [];
     sendJson(res, 200, {
       purchaseAvailable,
       plans: purchaseAvailable
@@ -454,7 +482,7 @@ export function createServer(options: ServerOptions): Server {
             expiresAt: new Date(status.expiresAt).toISOString(),
           }
         : null,
-      styles: { available: styleProvider.available, options: styleOptions },
+      styles: { groups: listStyleGroups({ includeAdvanced: isAdvancedStyleAllowed(openId) }) },
     });
   }
 
@@ -577,19 +605,27 @@ export function createServer(options: ServerOptions): Server {
 
     const rawStyle = req.headers['x-style'];
     const styleHeader = Array.isArray(rawStyle) ? rawStyle[0] : rawStyle;
-    // 缺省按原图处理；取值固定为六种，非法值直接拒绝。
+    // 缺省按原图处理；非法取值直接拒绝。
     const style = styleHeader === undefined || styleHeader === '' ? DEFAULT_STYLE : styleHeader;
     if (!isStyleId(style)) {
       sendError(res, 400, 'invalid-style', '不支持该风格，请重新选择');
       return;
     }
-    if (style !== 'original' && !styleProvider.available) {
-      sendError(res, 503, 'style-unavailable', '当前版本暂不支持风格化，请选择原图');
-      return;
-    }
 
     const token = String(req.headers['x-session-token'] ?? '');
     const openId = token ? session.openIdFor(token) : undefined;
+    // 免费风格始终可用；高级风格需要生成式服务已配置且当前身份被放行。
+    if (requiresGenerativeModel(style)) {
+      if (!styleProvider.available) {
+        sendError(res, 503, 'style-unavailable', '当前版本暂不支持高级风格，请选择其他风格');
+        return;
+      }
+      if (!isAdvancedStyleAllowed(openId)) {
+        sendError(res, 403, 'style-forbidden', '当前账号暂不可用该风格，请选择其他风格');
+        return;
+      }
+    }
+
     // 渠道由投放链接带入，非法值统一归为直接访问。
     const rawChannel = req.headers['x-channel'];
     const channel = sanitizeChannel(Array.isArray(rawChannel) ? rawChannel[0] : rawChannel);
@@ -697,6 +733,7 @@ export function createServer(options: ServerOptions): Server {
         ...patternSummary(record),
         style,
         styleLabel: style ? STYLE_LABELS[style] : undefined,
+        aiStyled: style ? requiresGenerativeModel(style) : undefined,
         candidate: record.candidate,
       },
     });

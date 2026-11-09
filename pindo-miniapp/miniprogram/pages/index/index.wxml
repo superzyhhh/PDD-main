@@ -122,18 +122,21 @@
       </view>
     </view>
 
-    <view wx:if="{{styleAvailable}}" class="option-block">
+    <view wx:if="{{styleGroups.length}}" class="option-block">
       <text class="option-title">风格族</text>
-      <view class="chips wrap">
-        <view
-          wx:for="{{styleOptions}}"
-          wx:key="id"
-          class="chip {{style === item.id ? 'active' : ''}}"
-          data-id="{{item.id}}"
-          bindtap="selectStyle"
-        >{{item.label}}</view>
+      <view wx:for="{{styleGroups}}" wx:for-item="group" wx:key="tier" class="style-group">
+        <text class="group-title">{{group.label}}</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{group.options}}"
+            wx:key="id"
+            class="chip {{style === item.id ? 'active' : ''}}"
+            data-id="{{item.id}}"
+            bindtap="selectStyle"
+          >{{item.label}}</view>
+        </view>
       </view>
-      <text class="notice">非原图风格会先做 AI 风格化，再生成拼豆图纸</text>
+      <text class="notice">风格转换在生成图纸前完成</text>
     </view>
 
     <view class="dropzone" bindtap="chooseImage">

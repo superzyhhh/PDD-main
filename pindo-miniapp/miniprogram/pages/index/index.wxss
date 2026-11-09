@@ -45,6 +45,17 @@
   color: #7A6F66;
 }
 
+.style-group + .style-group {
+  margin-top: 8rpx;
+}
+
+.group-title {
+  display: block;
+  margin-bottom: 10rpx;
+  font-size: 22rpx;
+  color: #9A8F85;
+}
+
 .chips {
   display: flex;
   flex-direction: row;
