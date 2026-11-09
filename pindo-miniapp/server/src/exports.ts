@@ -176,6 +176,17 @@ export async function renderHdExport(candidate: Candidate): Promise<Buffer> {
     .toBuffer();
 }
 
+/** 分享封面统一 640×640，微信卡片按 5:4 裁切时仍能看到图纸主体。 */
+export const SHARE_COVER_PX = 640;
+
+export async function renderShareCover(candidate: Candidate): Promise<Buffer> {
+  const image = await renderHdExport(candidate);
+  return sharp(image)
+    .resize(SHARE_COVER_PX, SHARE_COVER_PX, { fit: 'contain', background: '#FFFFFF' })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
 /** 浅色底用深字，深色底用白字，与预览端一致。 */
 export function textColor(hex: string): string {
   const r = parseInt(hex.slice(1, 3), 16);

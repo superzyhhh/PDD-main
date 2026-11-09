@@ -110,6 +110,33 @@ async function reportFailureSample(taskId, arrayBuffer, contentType = 'image/png
   throw apiErrorFrom(response, '反馈提交失败，请稍后重试');
 }
 
+// 原生分享：复制当前候选快照生成分享号，接收者无需登录即可查看这一张。
+async function createShare(taskId, candidateId, source) {
+  const token = await ensureSession();
+  const header = { 'content-type': 'application/json' };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/shares`,
+    method: 'POST',
+    data: { taskId, candidateId, source: source || 'menu' },
+    timeout: 10000,
+    header,
+  });
+  if (response.statusCode === 201) return response.data;
+  throw apiErrorFrom(response, '生成分享链接失败，请稍后再试');
+}
+
+// 公开查看分享：只按分享号取快照，不登录也不暴露分享者的其他图纸。
+async function getShare(shareId) {
+  const response = await request({
+    url: `${config.BASE_URL}/api/shares/${encodeURIComponent(shareId)}`,
+    method: 'GET',
+    timeout: 10000,
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '分享已失效');
+}
+
 // 导出：服务端校验登录与每日额度，返回可下载资源；type 为 hd（PNG）或 tiled（A4 PDF）。
 // 从「我的图纸」重开时只传 patternId，服务端用保存的快照出图并命中缓存。
 async function createExport(payload = {}) {
@@ -261,6 +288,8 @@ module.exports = {
   getTask,
   reportFailureSample,
   reportEvent,
+  createShare,
+  getShare,
   createExport,
   downloadExport,
   listPatterns,

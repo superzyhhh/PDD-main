@@ -1,5 +1,5 @@
 {
-  "pages": ["pages/index/index", "pages/patterns/patterns", "pages/membership/membership", "pages/purchase/purchase"],
+  "pages": ["pages/index/index", "pages/patterns/patterns", "pages/membership/membership", "pages/purchase/purchase", "pages/share/share"],
   "window": {
     "navigationBarTitleText": "拼豆图纸",
     "navigationBarBackgroundColor": "#FFFFFF",

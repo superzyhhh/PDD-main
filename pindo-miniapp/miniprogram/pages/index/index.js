@@ -101,8 +101,35 @@ Page({
     exportingType: '',
   },
 
+  /** 没有选中候选时没有可分享的图纸，先收起右上角转发入口。 */
+  onLoad() {
+    wx.hideShareMenu();
+  },
+
   onUnload() {
     this.cancelPoll();
+  },
+
+  /** 原生分享卡片：先落一个分享号，再把卡片指向公开查看页。 */
+  onShareAppMessage(res) {
+    const candidate = this.data.candidate;
+    const taskId = this.data.taskId;
+    const fallback = { title: '拼豆图纸生成', path: '/pages/index/index' };
+    if (!candidate || !taskId) return fallback;
+    const title = shareTitle(candidate);
+    const source = res && res.from === 'button' ? 'button' : 'menu';
+    return {
+      title,
+      path: fallback.path,
+      promise: api
+        .createShare(taskId, candidate.id, source)
+        .then((share) => ({
+          title,
+          path: `/pages/share/share?id=${share.shareId}`,
+          imageUrl: `${config.BASE_URL}${share.coverUrl}`,
+        }))
+        .catch(() => fallback),
+    };
   },
 
   /** 从「我的图纸」选了一张后返回本页：取快照并直接进入可导出的预览。 */
@@ -160,6 +187,7 @@ Page({
         this.paint('#thumb-0', labeled, thumbCell, false);
         this.paint('#pattern', labeled, cell, true);
       });
+      wx.showShareMenu({ menus: ['shareAppMessage'] });
     } catch (error) {
       this.showError(error.message, false);
     }
@@ -276,6 +304,7 @@ Page({
 
   async startGenerate() {
     this.cancelPoll();
+    wx.hideShareMenu();
     this.reportedSelections = {};
     this.reportingSelections = {};
     this.setData({
@@ -425,6 +454,7 @@ Page({
       ...materialSummary(candidate),
     });
     wx.nextTick(() => this.paint('#pattern', candidate, cell, true));
+    wx.showShareMenu({ menus: ['shareAppMessage'] });
     this.reportSelection(index, candidate);
     this.savePattern(candidate);
   },
@@ -670,6 +700,7 @@ Page({
 
   showError(message, canRetry) {
     this.cancelPoll();
+    wx.hideShareMenu();
     this.setData({
       stage: 'error',
       message: message || '生成失败，请稍后重试',
@@ -728,6 +759,12 @@ function contentTypeForPath(path) {
   if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
   if (ext === 'webp') return 'image/webp';
   return 'image/png';
+}
+
+/** 分享卡片标题用图纸本身的规格与色号数，接收者一眼知道要不要点开。 */
+function shareTitle(candidate) {
+  const colorCount = candidate.colors ? candidate.colors.length : 0;
+  return `${candidate.width}×${candidate.height} 拼豆图纸 · ${colorCount} 色`;
 }
 
 function delay(ms) {

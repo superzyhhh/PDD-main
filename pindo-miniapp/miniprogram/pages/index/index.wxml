@@ -228,6 +228,7 @@
     </block>
 
     <view class="actions">
+      <button wx:if="{{candidate}}" class="btn" open-type="share">分享给好友</button>
       <button class="btn" bindtap="chooseImage">换一张图</button>
       <view wx:if="{{hasImage}}" class="escape-link" bindtap="openDissatisfied">三张都不满意？</view>
     </view>

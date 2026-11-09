@@ -16,6 +16,7 @@ import {
   QuotaExceededError,
   exportKey,
   renderHdExport,
+  renderShareCover,
   type ExportFormat,
   type ExportRecord,
 } from './exports';
@@ -27,6 +28,7 @@ import { PaymentUnavailableError, unconfiguredPaymentProvider, type PaymentProvi
 import { MAX_PATTERNS, PatternStore, patternSummary } from './patterns';
 import { renderTiledPrintExport } from './print';
 import { createSessionService, type SessionService } from './session';
+import { MAX_SHARES, SHARE_SOURCES, ShareStore, type ShareRecord, type ShareSource } from './shares';
 import { TaskStore } from './store';
 import {
   PALETTE_TIERS,
@@ -120,6 +122,7 @@ export function createServer(options: ServerOptions): Server {
   const patterns = new PatternStore();
   const memberships = new MembershipStore();
   const failureSamples = new FailureSampleStore();
+  const shares = new ShareStore();
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
@@ -569,13 +572,22 @@ export function createServer(options: ServerOptions): Server {
     sendJson(res, 200, { ok: true });
   }
 
-  function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
+  /** 后台口令校验；不同后台只换提示文案与错误码。 */
+  function requireAdmin(
+    req: IncomingMessage,
+    res: ServerResponse,
+    labels = {
+      disabledCode: 'samples-disabled',
+      disabledMessage: '失败样本后台未启用',
+      forbiddenMessage: '无权查看失败样本',
+    },
+  ): boolean {
     if (!options.adminToken) {
-      sendError(res, 404, 'samples-disabled', '失败样本后台未启用');
+      sendError(res, 404, labels.disabledCode, labels.disabledMessage);
       return false;
     }
     if (String(req.headers['x-admin-token'] ?? '') !== options.adminToken) {
-      sendError(res, 403, 'admin-forbidden', '无权查看失败样本');
+      sendError(res, 403, 'admin-forbidden', labels.forbiddenMessage);
       return false;
     }
     return true;
@@ -671,6 +683,129 @@ export function createServer(options: ServerOptions): Server {
       'cache-control': 'no-store',
     });
     res.end(sample.image);
+  }
+
+  /** 分享记录只公开这一张候选快照，不带任务号、账号或其他图纸。 */
+  function shareView(record: ShareRecord): Record<string, unknown> {
+    return {
+      shareId: record.id,
+      candidate: record.candidate,
+      coverUrl: `/api/shares/${record.id}/cover`,
+      createdAt: new Date(record.createdAt).toISOString(),
+    };
+  }
+
+  /** 生成分享链接：复制当前候选快照，接收者无需登录即可查看。 */
+  async function handleCreateShare(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: { taskId?: unknown; candidateId?: unknown; source?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as {
+        taskId?: unknown;
+        candidateId?: unknown;
+        source?: unknown;
+      };
+    } catch {
+      sendError(res, 400, 'invalid-share', '分享参数不正确');
+      return;
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    const source = typeof body.source === 'string' ? body.source : 'menu';
+    if (!taskId || !candidateId || !SHARE_SOURCES.includes(source as ShareSource)) {
+      sendError(res, 400, 'invalid-share', '分享参数不正确');
+      return;
+    }
+
+    const meta = store.taskMeta(taskId);
+    if (!meta) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (meta.status !== 'completed' || !meta.candidates?.length) {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再分享');
+      return;
+    }
+    const openId = requestOpenId(req);
+    if (meta.openId && meta.openId !== openId) {
+      sendError(res, 403, 'share-forbidden', '只能分享自己生成的图纸');
+      return;
+    }
+    const candidate = meta.candidates.find((item) => item.id === candidateId);
+    if (!candidate) {
+      sendError(res, 400, 'invalid-share', '没有找到这张候选图纸');
+      return;
+    }
+
+    const record = shares.create({
+      taskId,
+      candidateId: candidate.id,
+      source: source as ShareSource,
+      candidate,
+      openId: meta.openId,
+    });
+    logger.audit('share_created', {
+      shareId: record.id,
+      taskId,
+      candidateId: candidate.id,
+      source,
+      openId: meta.openId,
+      at: new Date(record.createdAt).toISOString(),
+    });
+    sendJson(res, 201, { shareId: record.id, coverUrl: `/api/shares/${record.id}/cover` });
+  }
+
+  /** 公开查看：只按分享号取快照，无法枚举或越权打开其他图纸。 */
+  function handleGetShare(req: IncomingMessage, res: ServerResponse, shareId: string): void {
+    const record = shares.openAndCount(shareId);
+    if (!record) {
+      sendError(res, 404, 'share-not-found', '分享已失效');
+      return;
+    }
+    sendJson(res, 200, shareView(record));
+  }
+
+  async function handleShareCover(req: IncomingMessage, res: ServerResponse, shareId: string): Promise<void> {
+    const record = shares.get(shareId);
+    if (!record) {
+      sendError(res, 404, 'share-not-found', '分享已失效');
+      return;
+    }
+    const cover = await renderShareCover(record.candidate);
+    res.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': String(cover.length),
+      'cache-control': 'public, max-age=86400',
+    });
+    res.end(cover);
+  }
+
+  /** 后台统计分享次数、来源与打开次数。 */
+  function handleListShares(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (
+      !requireAdmin(req, res, {
+        disabledCode: 'shares-disabled',
+        disabledMessage: '分享后台未启用',
+        forbiddenMessage: '无权查看分享统计',
+      })
+    ) {
+      return;
+    }
+    const rawLimit = Number(url.searchParams.get('limit') ?? '20');
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(1, Math.floor(rawLimit)), MAX_SHARES)
+      : 20;
+    sendJson(res, 200, {
+      total: shares.total,
+      shares: shares.list(limit).map((record) => ({
+        shareId: record.id,
+        taskId: record.taskId,
+        candidateId: record.candidateId,
+        source: record.source,
+        openCount: record.openCount,
+        createdAt: new Date(record.createdAt).toISOString(),
+      })),
+    });
   }
 
   async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -953,6 +1088,29 @@ export function createServer(options: ServerOptions): Server {
       const sampleImageMatch = url.pathname.match(/^\/api\/failure-samples\/([^/]+)\/image$/);
       if (req.method === 'GET' && sampleImageMatch) {
         handleFailureSampleImage(req, res, decodeURIComponent(sampleImageMatch[1]));
+        return;
+      }
+
+      if (url.pathname === '/api/shares') {
+        if (req.method === 'POST') {
+          await handleCreateShare(req, res);
+          return;
+        }
+        if (req.method === 'GET') {
+          handleListShares(req, res, url);
+          return;
+        }
+      }
+
+      const shareCoverMatch = url.pathname.match(/^\/api\/shares\/([^/]+)\/cover$/);
+      if (req.method === 'GET' && shareCoverMatch) {
+        await handleShareCover(req, res, decodeURIComponent(shareCoverMatch[1]));
+        return;
+      }
+
+      const shareMatch = url.pathname.match(/^\/api\/shares\/([^/]+)$/);
+      if (req.method === 'GET' && shareMatch) {
+        handleGetShare(req, res, decodeURIComponent(shareMatch[1]));
         return;
       }
 
