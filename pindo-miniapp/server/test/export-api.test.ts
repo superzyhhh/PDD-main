@@ -187,6 +187,8 @@ describe('高清导出与免费额度', () => {
     const tokenA = await login(baseUrl, 'user-a');
     const tokenB = await login(baseUrl, 'user-b');
     const taskId = await createTask(baseUrl);
+    // 出图是异步任务，未完成时导出会返回 409，必须先等任务完成。
+    await waitForTask(baseUrl, taskId);
 
     const first = (await (
       await createExport(baseUrl, tokenA, { taskId, candidateId: 'detail' })
