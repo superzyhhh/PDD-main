@@ -91,19 +91,81 @@ async function getTask(taskId) {
 }
 
 // 导出：服务端校验登录与每日额度，返回可下载资源；type 为 hd（PNG）或 tiled（A4 PDF）。
-async function createExport(taskId, candidateId, type = 'hd') {
+// 从「我的图纸」重开时只传 patternId，服务端用保存的快照出图并命中缓存。
+async function createExport(payload = {}) {
+  const { taskId = '', candidateId = '', type = 'hd', patternId = '' } = payload;
   const token = await ensureSession();
   const header = { 'content-type': 'application/json' };
   if (token) header['x-session-token'] = token;
+  const data = patternId ? { patternId, type } : { taskId, candidateId, type };
   const response = await request({
     url: `${config.BASE_URL}/api/exports`,
     method: 'POST',
-    data: { taskId, candidateId, type },
+    data,
     timeout: 60000,
     header,
   });
   if (response.statusCode === 200) return response.data;
   throw apiErrorFrom(response, '导出失败，请稍后重试');
+}
+
+async function requireToken(message) {
+  const token = await ensureSession();
+  if (!token) throw new ApiError(message, 'login-required');
+  return token;
+}
+
+// 「我的图纸」只返回摘要；打开某一张时再取逐格矩阵。
+async function listPatterns() {
+  const token = await requireToken('请先登录再查看「我的图纸」');
+  const response = await request({
+    url: `${config.BASE_URL}/api/patterns`,
+    method: 'GET',
+    timeout: 10000,
+    header: { 'x-session-token': token },
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '图纸列表加载失败，请重试');
+}
+
+async function getPattern(patternId) {
+  const token = await requireToken('请先登录再查看「我的图纸」');
+  const response = await request({
+    url: `${config.BASE_URL}/api/patterns/${encodeURIComponent(patternId)}`,
+    method: 'GET',
+    timeout: 10000,
+    header: { 'x-session-token': token },
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '图纸加载失败，请重试');
+}
+
+// 选中候选后原地更新已保存的图纸；失败不打断预览。
+async function savePattern(taskId, candidateId) {
+  const token = await ensureSession();
+  const header = { 'content-type': 'application/json' };
+  if (token) header['x-session-token'] = token;
+  const response = await request({
+    url: `${config.BASE_URL}/api/patterns`,
+    method: 'POST',
+    data: { taskId, candidateId },
+    timeout: 10000,
+    header,
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '保存失败，请稍后重试');
+}
+
+async function deletePattern(patternId) {
+  const token = await requireToken('请先登录再删除图纸');
+  const response = await request({
+    url: `${config.BASE_URL}/api/patterns/${encodeURIComponent(patternId)}`,
+    method: 'DELETE',
+    timeout: 10000,
+    header: { 'x-session-token': token },
+  });
+  if (response.statusCode === 200) return response.data;
+  throw apiErrorFrom(response, '删除失败，请稍后重试');
 }
 
 // 下载已生成的导出资源；服务端要求登录且只能取本账号的资源。
@@ -180,6 +242,10 @@ module.exports = {
   reportEvent,
   createExport,
   downloadExport,
+  listPatterns,
+  getPattern,
+  savePattern,
+  deletePattern,
   getMembership,
   createMembershipOrder,
   login,

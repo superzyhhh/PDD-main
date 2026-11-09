@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Candidate, TaskFailure, TaskFailureCode, TaskStatus, TaskView } from './types';
+import type { Candidate, SavedPattern, TaskFailure, TaskFailureCode, TaskStatus, TaskView } from './types';
 
 interface TaskRecord {
   id: string;
@@ -8,6 +8,7 @@ interface TaskRecord {
   status: TaskStatus;
   candidates?: Candidate[];
   failure?: TaskFailure;
+  savedPattern?: SavedPattern;
   createdAt: number;
 }
 
@@ -46,6 +47,11 @@ export class TaskStore {
     return this.tasks.get(id)?.openId;
   }
 
+  setSavedPattern(id: string, saved: SavedPattern): void {
+    const record = this.tasks.get(id);
+    if (record) record.savedPattern = saved;
+  }
+
   markProcessing(id: string): void {
     const record = this.tasks.get(id);
     if (record && record.status === 'queued') record.status = 'processing';
@@ -71,6 +77,7 @@ export class TaskStore {
     const view: TaskView = { taskId: record.id, status: record.status };
     if (record.candidates) view.candidates = record.candidates;
     if (record.failure) view.failure = record.failure;
+    if (record.savedPattern) view.savedPattern = record.savedPattern;
     return view;
   }
 

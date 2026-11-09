@@ -16,6 +16,7 @@ import { MEMBERSHIP_PLANS, MembershipStore, PLAN_IDS, type PlanId } from './memb
 import type { Moderation } from './moderation';
 import { getAdvancedPalette, getBasicPalette } from './palette';
 import { PaymentUnavailableError, unconfiguredPaymentProvider, type PaymentProvider } from './payment';
+import { MAX_PATTERNS, PatternStore, patternSummary } from './patterns';
 import { renderTiledPrintExport } from './print';
 import { createSessionService, type SessionService } from './session';
 import { TaskStore } from './store';
@@ -24,6 +25,7 @@ import {
   SIZE_TIERS,
   type Candidate,
   type PaletteTier,
+  type SavedPattern,
   type SizeTier,
   type TaskFailureCode,
 } from './types';
@@ -97,6 +99,7 @@ export function createServer(options: ServerOptions): Server {
   const session = options.session ?? createSessionService();
   const store = new TaskStore();
   const exportStore = new ExportStore();
+  const patterns = new PatternStore();
   const memberships = new MembershipStore();
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
@@ -106,9 +109,33 @@ export function createServer(options: ServerOptions): Server {
   const advancedPalette = getAdvancedPalette();
   const extraAdvancedAllow = options.isAdvancedPaletteAllowed ?? (() => false);
 
+  /** 只复用同一请求上下文的任务：匿名归匿名，登录账号各自独立，保证生成即入我的图纸。 */
+  function reusableTaskFor(key: string, openId?: string) {
+    const reusable = store.findReusable(key);
+    if (!reusable || store.ownerOf(reusable.id) !== openId) return undefined;
+    return reusable;
+  }
+
   /** 291 档位以服务端会员状态为准，额外白名单只用于运营/测试。 */
   function isAdvancedPaletteAllowed(openId?: string): boolean {
     return extraAdvancedAllow(openId) || memberships.isMember(openId, now());
+  }
+
+  /** 把图纸快照存入「我的图纸」，并把淘汰数量挂回任务，供客户端提示。 */
+  function savePattern(openId: string, taskId: string, candidate: Candidate): SavedPattern {
+    const saved = patterns.save(openId, taskId, candidate);
+    const result: SavedPattern = { id: saved.pattern.id, evictedCount: saved.evictedCount };
+    store.setSavedPattern(taskId, result);
+    if (saved.evictedCount > 0) {
+      logger.audit('pattern_evicted', {
+        openId,
+        taskId,
+        evictedCount: saved.evictedCount,
+        limit: MAX_PATTERNS,
+        at: new Date().toISOString(),
+      });
+    }
+    return result;
   }
 
   async function runTask(taskId: string, image: Buffer, sizeTier: SizeTier, paletteTier: PaletteTier): Promise<void> {
@@ -116,7 +143,11 @@ export function createServer(options: ServerOptions): Server {
     try {
       const decoded = await decodeImage(image);
       const palette = paletteTier === 'advanced' ? advancedPalette : basicPalette;
-      store.complete(taskId, generateCandidates(decoded, palette, { sizeTier, paletteTier }));
+      const candidates = generateCandidates(decoded, palette, { sizeTier, paletteTier });
+      store.complete(taskId, candidates);
+      // 未登录任务不落库；登录用户在生成完成时自动保存默认候选。
+      const owner = store.ownerOf(taskId);
+      if (owner) savePattern(owner, taskId, candidates[0]);
     } catch (error) {
       const failure = failureFor(error);
       if (failure.code === 'internal') {
@@ -369,7 +400,7 @@ export function createServer(options: ServerOptions): Server {
     }
 
     const key = contentKey(image, sizeTier, paletteTier);
-    const reusable = store.findReusable(key);
+    const reusable = reusableTaskFor(key, openId);
     if (reusable) {
       sendJson(res, 202, { taskId: reusable.id, status: reusable.status });
       return;
@@ -400,7 +431,7 @@ export function createServer(options: ServerOptions): Server {
 
     // 内容安全校验是异步的，并发提交可能在此期间已经建出任务；这里再查一次，
     // 保证同一内容的并发请求只落一个任务。
-    const concurrent = store.findReusable(key);
+    const concurrent = reusableTaskFor(key, openId);
     if (concurrent) {
       sendJson(res, 202, { taskId: concurrent.id, status: concurrent.status });
       return;
@@ -411,59 +442,160 @@ export function createServer(options: ServerOptions): Server {
     setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier));
   }
 
-  async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const token = String(req.headers['x-session-token'] ?? '');
-    const openId = token ? session.openIdFor(token) : undefined;
-    if (!openId) {
-      sendError(res, 401, 'login-required', '请先登录再导出高清图纸');
+  /** 取当前登录账号；未登录时回 401 并返回 undefined。 */
+  function requireOpenId(req: IncomingMessage, res: ServerResponse, message: string): string | undefined {
+    const openId = requestOpenId(req);
+    if (!openId) sendError(res, 401, 'login-required', message);
+    return openId;
+  }
+
+  /** 「我的图纸」列表只返回摘要，逐格色号在打开时再取。 */
+  function handleListPatterns(req: IncomingMessage, res: ServerResponse): void {
+    const openId = requireOpenId(req, res, '请先登录再查看「我的图纸」');
+    if (!openId) return;
+    sendJson(res, 200, { limit: MAX_PATTERNS, patterns: patterns.list(openId).map(patternSummary) });
+  }
+
+  function handleGetPattern(req: IncomingMessage, res: ServerResponse, patternId: string): void {
+    const openId = requireOpenId(req, res, '请先登录再查看「我的图纸」');
+    if (!openId) return;
+    const record = patterns.get(openId, patternId);
+    if (!record) {
+      sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除');
       return;
     }
+    sendJson(res, 200, { pattern: { ...patternSummary(record), candidate: record.candidate } });
+  }
+
+  /** 选中其他候选后原地更新同一张图纸，不新增列表条目。 */
+  async function handleSavePattern(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const openId = requireOpenId(req, res, '请先登录再保存图纸');
+    if (!openId) return;
+
+    let body: { taskId?: unknown; candidateId?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as { taskId?: unknown; candidateId?: unknown };
+    } catch {
+      sendError(res, 400, 'invalid-pattern', '图纸参数不正确');
+      return;
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    if (!taskId || !candidateId) {
+      sendError(res, 400, 'invalid-pattern', '图纸参数不正确');
+      return;
+    }
+
+    const view = store.toView(taskId);
+    if (!view) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (view.status !== 'completed') {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再保存');
+      return;
+    }
+    // 匿名任务不落库：只有任务所有者本人才能保存。
+    const owner = store.ownerOf(taskId);
+    if (!owner || owner !== openId) {
+      sendError(res, 403, 'pattern-forbidden', '只能保存自己生成的图纸');
+      return;
+    }
+    const candidate = view.candidates?.find((item) => item.id === candidateId);
+    if (!candidate) {
+      sendError(res, 400, 'invalid-pattern', '没有找到这张候选图纸');
+      return;
+    }
+
+    const saved = savePattern(openId, taskId, candidate);
+    const record = patterns.get(openId, saved.id);
+    if (!record) {
+      sendError(res, 500, 'internal', '保存失败，请稍后重试');
+      return;
+    }
+    sendJson(res, 200, { pattern: patternSummary(record), evictedCount: saved.evictedCount });
+  }
+
+  function handleDeletePattern(req: IncomingMessage, res: ServerResponse, patternId: string): void {
+    const openId = requireOpenId(req, res, '请先登录再删除图纸');
+    if (!openId) return;
+    if (!patterns.remove(openId, patternId)) {
+      sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除');
+      return;
+    }
+    sendJson(res, 200, { ok: true });
+  }
+
+  async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const openId = requireOpenId(req, res, '请先登录再导出高清图纸');
+    if (!openId) return;
     // 会员无限导出；非会员按上海自然日计 1 次。额度一律由服务端判定。
     const quotaLimit = memberships.isMember(openId, now()) ? null : FREE_DAILY_EXPORT_LIMIT;
 
-    let body: { taskId?: unknown; candidateId?: unknown; type?: unknown };
+    let body: { taskId?: unknown; candidateId?: unknown; patternId?: unknown; type?: unknown };
     try {
       const raw = await readBody(req, 4096);
       body = JSON.parse(raw.toString('utf8') || '{}') as {
         taskId?: unknown;
         candidateId?: unknown;
+        patternId?: unknown;
         type?: unknown;
       };
     } catch {
       sendError(res, 400, 'invalid-export', '导出参数不正确');
       return;
     }
-    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
-    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    let taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    let candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    const patternId = typeof body.patternId === 'string' ? body.patternId : '';
     const format: ExportFormat | undefined =
       body.type === undefined || body.type === 'hd'
         ? 'hd'
         : body.type === 'tiled'
           ? 'tiled'
           : undefined;
-    if (!taskId || !candidateId || !format) {
+    if (!format) {
       sendError(res, 400, 'invalid-export', '导出参数不正确');
       return;
     }
 
-    const view = store.toView(taskId);
-    if (!view) {
-      sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
-      return;
-    }
-    if (view.status !== 'completed') {
-      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再导出');
-      return;
-    }
-    const candidate = view.candidates?.find((item) => item.id === candidateId);
-    if (!candidate) {
-      sendError(res, 400, 'invalid-export', '没有找到这张候选图纸');
-      return;
-    }
-    const owner = store.ownerOf(taskId);
-    if (owner && owner !== openId) {
-      sendError(res, 403, 'export-forbidden', '无权导出该图纸');
-      return;
+    let candidate: Candidate;
+    if (patternId) {
+      // 从「我的图纸」重开时用保存的快照，任务表淘汰后仍可导出，缓存键不变。
+      const record = patterns.get(openId, patternId);
+      if (!record) {
+        sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除，请重新生成');
+        return;
+      }
+      taskId = record.taskId;
+      candidateId = record.candidate.id;
+      candidate = record.candidate;
+    } else {
+      if (!taskId || !candidateId) {
+        sendError(res, 400, 'invalid-export', '导出参数不正确');
+        return;
+      }
+      const view = store.toView(taskId);
+      if (!view) {
+        sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
+        return;
+      }
+      if (view.status !== 'completed') {
+        sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再导出');
+        return;
+      }
+      const found = view.candidates?.find((item) => item.id === candidateId);
+      if (!found) {
+        sendError(res, 400, 'invalid-export', '没有找到这张候选图纸');
+        return;
+      }
+      candidate = found;
+      const owner = store.ownerOf(taskId);
+      if (owner && owner !== openId) {
+        sendError(res, 403, 'export-forbidden', '无权导出该图纸');
+        return;
+      }
     }
 
     const key = exportKey(openId, taskId, candidateId, format);
@@ -636,6 +768,30 @@ export function createServer(options: ServerOptions): Server {
       if (req.method === 'POST' && url.pathname === '/api/events') {
         await handleEvent(req, res);
         return;
+      }
+
+      if (url.pathname === '/api/patterns') {
+        if (req.method === 'GET') {
+          handleListPatterns(req, res);
+          return;
+        }
+        if (req.method === 'POST') {
+          await handleSavePattern(req, res);
+          return;
+        }
+      }
+
+      const patternMatch = url.pathname.match(/^\/api\/patterns\/([^/]+)$/);
+      if (patternMatch) {
+        const patternId = decodeURIComponent(patternMatch[1]);
+        if (req.method === 'GET') {
+          handleGetPattern(req, res, patternId);
+          return;
+        }
+        if (req.method === 'DELETE') {
+          handleDeletePattern(req, res, patternId);
+          return;
+        }
       }
 
       if (req.method === 'POST' && url.pathname === '/api/exports') {

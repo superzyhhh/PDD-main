@@ -1,12 +1,15 @@
 const api = require('../../utils/api');
 const config = require('../../utils/config');
+const { labelForCandidate } = require('../../utils/candidate-labels');
 
 const THUMB_WIDTH = 145;
 const DETAIL_MAX_PX = 812;
 const MAX_CELL = 28;
 const MIN_CELL_FOR_CODES = 14;
 const PAGE_H_PADDING_RPX = 48;
-const CANDIDATE_LABELS = ['保主体细节', '保色彩层次', '保少色号'];
+const PATTERN_LIMIT = 50;
+const DEFAULT_PICK_HINT = '三个候选，选一张你更愿意照着拼的';
+const REOPEN_HINT = '已从「我的图纸」打开，可直接导出';
 
 Page({
   data: {
@@ -15,6 +18,8 @@ Page({
     message: '',
     canRetry: false,
     taskId: '',
+    patternId: '',
+    previewHint: DEFAULT_PICK_HINT,
     sizeTier: 'small',
     paletteTier: 'basic',
     sizeOptions: [
@@ -37,6 +42,62 @@ Page({
 
   onUnload() {
     this.cancelPoll();
+  },
+
+  /** 从「我的图纸」选了一张后返回本页：取快照并直接进入可导出的预览。 */
+  onShow() {
+    const pending = getApp().globalData.pendingPattern;
+    if (!pending || !pending.patternId) return;
+    getApp().globalData.pendingPattern = null;
+    this.openSavedPattern(pending.patternId);
+  },
+
+  openPatterns() {
+    wx.navigateTo({ url: '/pages/patterns/patterns' });
+  },
+
+  /** 用服务端保存的快照重新打开一张旧图纸；导出走 patternId，缓存命中不重复扣次。 */
+  async openSavedPattern(patternId) {
+    this.cancelPoll();
+    this.setData({
+      stage: 'processing',
+      statusText: '正在打开图纸',
+      message: '',
+      canRetry: false,
+      candidates: [],
+      selectedIndex: -1,
+      candidate: null,
+      canvasSize: 0,
+      thumbSize: 0,
+    });
+    try {
+      const result = await api.getPattern(patternId);
+      const saved = result.pattern && result.pattern.candidate;
+      if (!saved) throw new api.ApiError('图纸不存在或已删除', 'unknown');
+      const labeled = {
+        ...saved,
+        label: labelForCandidate(saved.id),
+      };
+      const thumbCell = Math.max(1, Math.floor(THUMB_WIDTH / labeled.width));
+      const cell = detailCell(labeled);
+      this.setData({
+        stage: 'preview',
+        taskId: result.pattern.taskId || '',
+        patternId,
+        previewHint: REOPEN_HINT,
+        candidates: [labeled],
+        selectedIndex: 0,
+        candidate: labeled,
+        canvasSize: labeled.width * cell,
+        thumbSize: labeled.width * thumbCell,
+      });
+      wx.nextTick(() => {
+        this.paint('#thumb-0', labeled, thumbCell, false);
+        this.paint('#pattern', labeled, cell, true);
+      });
+    } catch (error) {
+      this.showError(error.message, false);
+    }
   },
 
   selectSize(event) {
@@ -89,6 +150,8 @@ Page({
       statusText: '正在上传图片',
       message: '',
       canRetry: false,
+      patternId: '',
+      previewHint: DEFAULT_PICK_HINT,
       candidates: [],
       selectedIndex: -1,
       candidate: null,
@@ -123,7 +186,7 @@ Page({
       try {
         const task = await api.getTask(taskId);
         if (task.status === 'completed') {
-          this.showCandidates(task.candidates || []);
+          this.showCandidates(task);
           return;
         }
         if (task.status === 'failed') {
@@ -151,14 +214,15 @@ Page({
     }
   },
 
-  showCandidates(candidates) {
+  showCandidates(task) {
+    const candidates = task.candidates || [];
     if (!candidates.length) {
       this.showError('没有拿到图纸，请重试', true);
       return;
     }
-    const list = candidates.slice(0, CANDIDATE_LABELS.length).map((candidate, index) => ({
+    const list = candidates.slice(0, 3).map((candidate) => ({
       ...candidate,
-      label: CANDIDATE_LABELS[index],
+      label: labelForCandidate(candidate.id),
     }));
     const thumbCell = Math.max(1, Math.floor(THUMB_WIDTH / list[0].width));
     const thumbSize = list[0].width * thumbCell;
@@ -166,6 +230,8 @@ Page({
       stage: 'preview',
       message: '',
       canRetry: false,
+      patternId: '',
+      previewHint: DEFAULT_PICK_HINT,
       candidates: list,
       selectedIndex: -1,
       candidate: null,
@@ -174,6 +240,19 @@ Page({
     });
     wx.nextTick(() => {
       list.forEach((candidate, index) => this.paint(`#thumb-${index}`, candidate, thumbCell, false));
+    });
+    if (task.savedPattern && task.savedPattern.evictedCount > 0) {
+      this.showPatternEvictionNotice(task.savedPattern.evictedCount);
+    }
+  },
+
+  /** 入列表时超出上限：明确告诉用户哪些旧图被清理了。 */
+  showPatternEvictionNotice(count) {
+    wx.showModal({
+      title: '「我的图纸」已满',
+      content: `只保留最近 ${PATTERN_LIMIT} 张图纸，最早的 ${count} 张已自动清理。已保存到相册的图片不受影响。`,
+      showCancel: false,
+      confirmText: '知道了',
     });
   },
 
@@ -189,6 +268,14 @@ Page({
     });
     wx.nextTick(() => this.paint('#pattern', candidate, cell, true));
     this.reportSelection(index, candidate);
+    this.savePattern(candidate);
+  },
+
+  /** 选中的候选就是「我的图纸」里这张图纸当前展示的候选；保存失败不打断预览。 */
+  savePattern(candidate) {
+    const taskId = this.data.taskId;
+    if (!taskId) return;
+    api.savePattern(taskId, candidate.id).catch(() => {});
   },
 
   /** 选中即上报；同一任务同一候选只报一次，上报失败则允许下次点击重试。 */
@@ -212,14 +299,14 @@ Page({
   },
 
   /** 导出遇到 401 时静默重新登录再试一次，登录后额度按账号继承。 */
-  async requestExport(taskId, candidateId, type) {
+  async requestExport(payload) {
     try {
-      return await api.createExport(taskId, candidateId, type);
+      return await api.createExport(payload);
     } catch (error) {
       if (error.code !== 'login-required') throw error;
       const token = await api.login();
       if (!token) throw error;
-      return api.createExport(taskId, candidateId, type);
+      return api.createExport(payload);
     }
   },
 
@@ -234,11 +321,13 @@ Page({
   async doExport(type) {
     const candidate = this.data.candidate;
     const taskId = this.data.taskId;
-    if (!candidate || !taskId || this.data.exporting) return;
+    const patternId = this.data.patternId;
+    if (!candidate || (!taskId && !patternId) || this.data.exporting) return;
 
     this.setData({ exporting: true, exportingType: type });
     try {
-      const result = await this.requestExport(taskId, candidate.id, type);
+      const payload = { taskId, candidateId: candidate.id, patternId, type };
+      const result = await this.requestExport(payload);
       const filePath = await api.downloadExport(result.url);
       if (type === 'tiled') {
         await openPdf(filePath);

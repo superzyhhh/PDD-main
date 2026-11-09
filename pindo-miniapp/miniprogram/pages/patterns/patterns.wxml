@@ -1,0 +1,40 @@
+<view class="page">
+  <view class="header">
+    <text class="title">我的图纸</text>
+    <text class="subtitle">云端保存最近 {{limit}} 张，超出后自动清理最早的一张</text>
+  </view>
+
+  <view wx:if="{{loading}}" class="state">
+    <text class="state-text">正在加载图纸…</text>
+  </view>
+
+  <view wx:elif="{{error}}" class="state">
+    <text class="state-text">{{error}}</text>
+    <button class="btn" bindtap="retryLoad">重试</button>
+  </view>
+
+  <view wx:elif="{{!patterns.length}}" class="state">
+    <text class="state-text">还没有保存的图纸</text>
+    <text class="state-hint">登录后生成的图纸会自动出现在这里</text>
+  </view>
+
+  <block wx:else>
+    <view
+      wx:for="{{patterns}}"
+      wx:key="id"
+      class="pattern-card"
+      data-id="{{item.id}}"
+      bindtap="openPattern"
+    >
+      <view class="pattern-info">
+        <text class="pattern-label">{{item.label}}</text>
+        <text class="pattern-meta">{{item.meta}}</text>
+        <text class="pattern-date">{{item.date}}</text>
+      </view>
+      <view class="pattern-actions">
+        <text class="pattern-open">打开</text>
+        <text class="pattern-delete" data-id="{{item.id}}" catchtap="deletePattern">删除</text>
+      </view>
+    </view>
+  </block>
+</view>

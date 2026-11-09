@@ -1,6 +1,9 @@
 <view class="page">
   <view class="header">
-    <text class="title">上传一张图，直接出图纸</text>
+    <view class="header-top">
+      <text class="title">上传一张图，直接出图纸</text>
+      <text class="header-link" bindtap="openPatterns">我的图纸 ›</text>
+    </view>
     <text class="subtitle">自动抠主体 · 自动配色 · MARD 221 / 291 可选</text>
   </view>
 
@@ -53,7 +56,7 @@
   </block>
 
   <block wx:elif="{{stage === 'preview'}}">
-    <view class="pick-hint">三个候选，选一张你更愿意照着拼的</view>
+    <view class="pick-hint">{{previewHint}}</view>
 
     <view class="candidate-list">
       <view

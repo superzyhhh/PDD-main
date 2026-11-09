@@ -52,4 +52,25 @@ export interface TaskView {
   status: TaskStatus;
   candidates?: Candidate[];
   failure?: TaskFailure;
+  /** 登录用户生成完成后的保存结果；未登录或保存失败时不存在。 */
+  savedPattern?: SavedPattern;
+}
+
+/** 「我的图纸」保存结果；evictedCount 用于提示用户旧图已被清理。 */
+export interface SavedPattern {
+  id: string;
+  evictedCount: number;
+}
+
+/** 列表页摘要，不含逐格色号矩阵。 */
+export interface PatternSummary {
+  id: string;
+  taskId: string;
+  candidateId: CandidateId;
+  width: number;
+  height: number;
+  boardCount: number;
+  colorCodeCount: number;
+  /** 首次保存时间，ISO 字符串。 */
+  createdAt: string;
 }

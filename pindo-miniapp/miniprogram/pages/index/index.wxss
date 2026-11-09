@@ -7,10 +7,24 @@
   padding: 24rpx 8rpx 32rpx;
 }
 
+.header-top {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
 .title {
   display: block;
   font-size: 40rpx;
   font-weight: 600;
+}
+
+.header-link {
+  flex-shrink: 0;
+  margin-left: 16rpx;
+  font-size: 24rpx;
+  color: #2B2622;
 }
 
 .subtitle {
