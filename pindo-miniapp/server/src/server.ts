@@ -39,12 +39,17 @@ import { createSessionService, type SessionService } from './session';
 import { MAX_SHARES, SHARE_SOURCES, ShareStore, type ShareRecord, type ShareSource } from './shares';
 import {
   DEFAULT_STYLE,
+  DEFAULT_STYLE_TIMEOUT_MS,
   STYLE_IDS,
   STYLE_LABELS,
+  StyleCache,
   isStyleId,
+  styleCacheKey,
   unconfiguredStyleProvider,
   type StyleId,
+  type StyleInput,
   type StyleProvider,
+  type StylizedImage,
 } from './style';
 import { TaskStore, type TaskMeta } from './store';
 import {
@@ -155,6 +160,9 @@ export function createServer(options: ServerOptions): Server {
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   const styleProvider = options.style ?? unconfiguredStyleProvider;
+  const styleCache = new StyleCache();
+  /** 同一张原图同一种风格的并发请求合并成一次调用，避免重复计费。 */
+  const pendingStyles = new Map<string, Promise<StylizedImage>>();
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
   const pendingExports = new Map<string, Promise<ExportRecord>>();
   const basicPalette = getBasicPalette();
@@ -201,6 +209,36 @@ export function createServer(options: ServerOptions): Server {
     store.fail(taskId, 'style-failed', '风格化失败，请重试');
   }
 
+  /** 给风格服务调用套上超时与取消，避免第三方无响应时任务一直挂起。 */
+  async function stylizeWithTimeout(input: StyleInput): Promise<StylizedImage> {
+    const controller = new AbortController();
+    const timeoutMs = styleProvider.timeoutMs ?? DEFAULT_STYLE_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error('风格服务超时'));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([
+        styleProvider.stylize({ ...input, signal: controller.signal }),
+        timeout,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** 缓存未命中时合并同键并发请求，缓存命中则不再调用风格服务。 */
+  function stylizeOnce(cacheKey: string, input: StyleInput): Promise<StylizedImage> {
+    const pending = pendingStyles.get(cacheKey);
+    if (pending) return pending;
+    const request = stylizeWithTimeout(input).finally(() => pendingStyles.delete(cacheKey));
+    pendingStyles.set(cacheKey, request);
+    return request;
+  }
+
   async function runTask(taskId: string, image: Buffer, meta: TaskMeta): Promise<void> {
     const { sizeTier, paletteTier, settings, style } = meta;
     store.markProcessing(taskId);
@@ -208,44 +246,52 @@ export function createServer(options: ServerOptions): Server {
       const source = await decodeImage(image);
       let decoded = source;
       if (style !== 'original') {
-        // 风格化在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
-        let styled;
-        try {
-          styled = await styleProvider.stylize({
-            buffer: await encodeImage(source),
-            contentType: 'image/png',
-            style,
-          });
-        } catch (error) {
-          failStyle(taskId, style, 'provider', error);
-          return;
-        }
+        // 风格缓存以原图内容 + 风格 + 模型版本为键：仅改尺寸/色卡/高级设置时直接复用。
+        const cacheKey = styleCacheKey(image, style, styleProvider.version);
+        const cached = styleCache.get(cacheKey);
+        let styled: StylizedImage;
+        if (cached) {
+          // 缓存命中的风格图在首次生成时已通过内容安全，无需重复校验。
+          styled = cached;
+        } else {
+          // 风格化在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
+          try {
+            styled = await stylizeOnce(cacheKey, {
+              buffer: await encodeImage(source),
+              contentType: 'image/png',
+              style,
+            });
+          } catch (error) {
+            failStyle(taskId, style, 'provider', error);
+            return;
+          }
 
-        // 风格图输出同样要过内容安全，命中即结束任务，不进入出图。
-        let verdict: 'pass' | 'block' = 'pass';
-        try {
-          verdict = await moderation.check({
-            buffer: styled.buffer,
-            contentType: styled.contentType,
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          logger.warn('moderation_error', { taskId, stage: 'style-output', error: message });
-          logger.audit('moderation_skipped', {
-            taskId,
-            stage: 'style-output',
-            reason: message,
-            at: new Date().toISOString(),
-          });
-        }
-        if (verdict === 'block') {
-          logger.audit('content_blocked', {
-            taskId,
-            stage: 'style-output',
-            at: new Date().toISOString(),
-          });
-          store.fail(taskId, 'style-blocked', '风格化结果不符合内容规范，请换一张图');
-          return;
+          // 风格图输出同样要过内容安全，命中即结束任务，不进入出图。
+          let verdict: 'pass' | 'block' = 'pass';
+          try {
+            verdict = await moderation.check({
+              buffer: styled.buffer,
+              contentType: styled.contentType,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.warn('moderation_error', { taskId, stage: 'style-output', error: message });
+            logger.audit('moderation_skipped', {
+              taskId,
+              stage: 'style-output',
+              reason: message,
+              at: new Date().toISOString(),
+            });
+          }
+          if (verdict === 'block') {
+            logger.audit('content_blocked', {
+              taskId,
+              stage: 'style-output',
+              at: new Date().toISOString(),
+            });
+            store.fail(taskId, 'style-blocked', '风格化结果不符合内容规范，请换一张图');
+            return;
+          }
         }
 
         try {
@@ -254,6 +300,7 @@ export function createServer(options: ServerOptions): Server {
           failStyle(taskId, style, 'decode', error);
           return;
         }
+        if (!cached) styleCache.set(cacheKey, styled);
       }
 
       const palette = filterPaletteBySeries(

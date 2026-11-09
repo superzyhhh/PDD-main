@@ -153,6 +153,7 @@
     <view class="state">
       <text class="state-title">{{message}}</text>
       <button wx:if="{{canRetry}}" class="btn primary" bindtap="retry">重试</button>
+      <button wx:if="{{canSkipStyle}}" class="btn" bindtap="skipStyle">跳过风格，按原图生成</button>
       <button class="btn" bindtap="chooseImage">换一张图</button>
     </view>
   </block>

@@ -4,7 +4,12 @@ import type { Server } from 'node:http';
 import sharp from 'sharp';
 import { createServer, type ServerOptions } from '../src/server';
 import type { Moderation } from '../src/moderation';
-import { STYLE_IDS, createFakeStyleProvider, type StyleProvider } from '../src/style';
+import {
+  STYLE_IDS,
+  createFakeStyleProvider,
+  styleCacheKey,
+  type StyleProvider,
+} from '../src/style';
 
 const allowAll: Moderation = { check: async () => 'pass' };
 
@@ -43,6 +48,7 @@ interface UploadOptions {
   sizeTier?: string;
   paletteTier?: string;
   style?: string;
+  settings?: unknown;
 }
 
 function upload(baseUrl: string, image: Buffer, options: UploadOptions = {}): Promise<Response> {
@@ -52,6 +58,7 @@ function upload(baseUrl: string, image: Buffer, options: UploadOptions = {}): Pr
     'x-palette-tier': options.paletteTier ?? 'basic',
   };
   if (options.style) headers['x-style'] = options.style;
+  if (options.settings) headers['x-advanced-settings'] = JSON.stringify(options.settings);
   return fetch(`${baseUrl}/api/generate`, { method: 'POST', headers, body: image });
 }
 
@@ -81,7 +88,7 @@ function recordingProvider(inner: StyleProvider = createFakeStyleProvider()): {
 } {
   const calls: Array<{ style: string; contentType: string; buffer: Buffer }> = [];
   const provider: StyleProvider = {
-    available: true,
+    ...inner,
     async stylize(input) {
       calls.push({ style: input.style, contentType: input.contentType, buffer: input.buffer });
       return inner.stylize(input);
@@ -207,6 +214,210 @@ describe('风格族选择与风格服务骨架', () => {
     };
     expect(body.styles.available).toBe(false);
     expect(body.styles.options).toEqual([]);
+  });
+});
+
+describe('风格缓存与失败降级', () => {
+  it('同图同风格同参数重复提交复用任务，不重复调用风格服务', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const firstId = await submit(baseUrl, image, { style: 'anime' });
+    await waitForTask(baseUrl, firstId);
+
+    const response = await upload(baseUrl, image, { style: 'anime' });
+    expect(response.status).toBe(202);
+    const body = (await response.json()) as { taskId: string };
+    expect(body.taskId).toBe(firstId);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('仅改成品尺寸档时复用已风格化的图片，不重复调用风格服务', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const small = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime' }));
+    const medium = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'anime', sizeTier: 'medium' }),
+    );
+
+    expect(small.status).toBe('completed');
+    expect(medium.status).toBe('completed');
+    expect(small.style).toBe('anime');
+    expect(medium.style).toBe('anime');
+    expect(medium.candidates[0].width).toBeGreaterThan(small.candidates[0].width);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('仅改色卡档时复用已风格化的图片，不重复调用风格服务', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider, isAdvancedPaletteAllowed: () => true });
+    const image = await redSquarePng();
+
+    const basic = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'anime', paletteTier: 'basic' }),
+    );
+    const advanced = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'anime', paletteTier: 'advanced' }),
+    );
+
+    expect(advanced.status).toBe('completed');
+    expect(basic.candidates[0].paletteTier).toBe('basic');
+    expect(advanced.candidates[0].paletteTier).toBe('advanced');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('仅改高级设置时复用已风格化的图片，不重复调用风格服务', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const defaults = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime' }));
+    const tuned = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'anime', settings: { maxColors: 20 } }),
+    );
+
+    expect(defaults.status).toBe('completed');
+    expect(tuned.status).toBe('completed');
+    expect(tuned.settings.maxColors).toBe(20);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('同图同风格的并发请求只调用一次风格服务', async () => {
+    const inner = createFakeStyleProvider();
+    let calls = 0;
+    const provider: StyleProvider = {
+      available: true,
+      version: 'slow-v1',
+      timeoutMs: 2000,
+      async stylize(input) {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return inner.stylize(input);
+      },
+    };
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const [smallId, mediumId] = await Promise.all([
+      submit(baseUrl, image, { style: 'anime' }),
+      submit(baseUrl, image, { style: 'anime', sizeTier: 'medium' }),
+    ]);
+    await Promise.all([waitForTask(baseUrl, smallId), waitForTask(baseUrl, mediumId)]);
+
+    expect(calls).toBe(1);
+  });
+
+  it('风格化失败不写入缓存，重试会再次调用风格服务', async () => {
+    let attempts = 0;
+    const inner = createFakeStyleProvider();
+    const provider: StyleProvider = {
+      available: true,
+      version: 'flaky-v1',
+      async stylize(input) {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporary provider failure');
+        return inner.stylize(input);
+      },
+    };
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const failed = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime' }));
+    expect(failed.status).toBe('failed');
+    expect(failed.failure.code).toBe('style-failed');
+
+    const retried = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime' }));
+    expect(retried.status).toBe('completed');
+    expect(attempts).toBe(2);
+  });
+
+  it('风格缓存键区分原图内容、风格与模型版本', async () => {
+    const image = await redSquarePng();
+    const key = styleCacheKey(image, 'anime', 'v1');
+
+    expect(key).toBe(styleCacheKey(image, 'anime', 'v1'));
+    expect(key).not.toBe(styleCacheKey(image, 'anime', 'v2'));
+    expect(key).not.toBe(styleCacheKey(image, 'chibi', 'v1'));
+    expect(key).not.toBe(styleCacheKey(await redSquarePng(65), 'anime', 'v1'));
+  });
+
+  it('换风格重新调用风格服务并产生新图纸', async () => {
+    const { provider, calls } = recordingProvider();
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const animeId = await submit(baseUrl, image, { style: 'anime' });
+    const anime = await waitForTask(baseUrl, animeId);
+    const chibiId = await submit(baseUrl, image, { style: 'chibi' });
+    const chibi = await waitForTask(baseUrl, chibiId);
+
+    expect(animeId).not.toBe(chibiId);
+    expect(anime.style).toBe('anime');
+    expect(chibi.style).toBe('chibi');
+    expect(calls.map((call) => call.style)).toEqual(['anime', 'chibi']);
+  });
+
+  it('风格服务超时后任务以风格化失败结束且不产出候选', async () => {
+    const { provider, calls } = recordingProvider(
+      createFakeStyleProvider({ behavior: 'timeout', timeoutMs: 40 }),
+    );
+    const baseUrl = await startApp({ style: provider });
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'anime' }));
+
+    expect(task.status).toBe('failed');
+    expect(task.candidates).toBeUndefined();
+    expect(task.failure.code).toBe('style-failed');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('风格服务非成功响应时任务以风格化失败结束', async () => {
+    const baseUrl = await startApp({
+      style: createFakeStyleProvider({ behavior: 'error' }),
+    });
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'anime' }));
+
+    expect(task.status).toBe('failed');
+    expect(task.candidates).toBeUndefined();
+    expect(task.failure.code).toBe('style-failed');
+  });
+
+  it('风格服务返回不可解码图片时任务以风格化失败结束', async () => {
+    const baseUrl = await startApp({
+      style: createFakeStyleProvider({ behavior: 'bad-image' }),
+    });
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redSquarePng(), { style: 'anime' }));
+
+    expect(task.status).toBe('failed');
+    expect(task.candidates).toBeUndefined();
+    expect(task.failure.code).toBe('style-failed');
+  });
+
+  it('风格化失败后可按原图继续生成，不重复调用风格服务', async () => {
+    const { provider, calls } = recordingProvider(
+      createFakeStyleProvider({ behavior: 'error' }),
+    );
+    const baseUrl = await startApp({ style: provider });
+    const image = await redSquarePng();
+
+    const failed = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'anime' }));
+    expect(failed.status).toBe('failed');
+    expect(failed.failure.code).toBe('style-failed');
+
+    const fallback = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'original' }));
+    expect(fallback.status).toBe('completed');
+    expect(fallback.style).toBe('original');
+    expect(fallback.candidates).toHaveLength(3);
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -43,6 +43,7 @@ Page({
     statusText: '',
     message: '',
     canRetry: false,
+    canSkipStyle: false,
     taskId: '',
     patternId: '',
     previewHint: DEFAULT_PICK_HINT,
@@ -176,6 +177,7 @@ Page({
       statusText: '正在打开图纸',
       message: '',
       canRetry: false,
+      canSkipStyle: false,
       hasImage: false,
       advancedDirty: false,
       appliedSettings: '',
@@ -335,6 +337,12 @@ Page({
     else this.chooseImage();
   },
 
+  /** 风格化失败后一键跳过风格，按原图继续生成；复用已选图片，无需重新上传。 */
+  skipStyle() {
+    this.setData({ style: 'original' });
+    this.retry();
+  },
+
   async startGenerate() {
     this.cancelPoll();
     wx.hideShareMenu();
@@ -345,6 +353,7 @@ Page({
       statusText: '正在上传图片',
       message: '',
       canRetry: false,
+      canSkipStyle: false,
       hasImage: true,
       patternId: '',
       previewHint: DEFAULT_PICK_HINT,
@@ -413,7 +422,8 @@ Page({
             failure.code !== 'image-unsupported' &&
             failure.code !== 'image-too-large' &&
             failure.code !== 'style-blocked';
-          this.showError(failure.message || '生成失败，请稍后重试', retryable);
+          const skippable = failure.code === 'style-failed' && this.data.style !== 'original';
+          this.showError(failure.message || '生成失败，请稍后重试', retryable, skippable);
           return;
         }
         if (Date.now() - startedAt > config.POLL_TIMEOUT_MS) {
@@ -453,6 +463,7 @@ Page({
       stage: 'preview',
       message: '',
       canRetry: false,
+      canSkipStyle: false,
       patternId: '',
       previewHint: DEFAULT_PICK_HINT,
       style,
@@ -542,6 +553,7 @@ Page({
       stage: 'dissatisfied',
       message: '',
       canRetry: false,
+      canSkipStyle: false,
       sampleReporting: true,
       sampleReported: false,
     });
@@ -747,13 +759,14 @@ Page({
       });
   },
 
-  showError(message, canRetry) {
+  showError(message, canRetry, canSkipStyle = false) {
     this.cancelPoll();
     wx.hideShareMenu();
     this.setData({
       stage: 'error',
       message: message || '生成失败，请稍后重试',
       canRetry: !!canRetry,
+      canSkipStyle: !!canSkipStyle,
       candidates: [],
       selectedIndex: -1,
       candidate: null,
