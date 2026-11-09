@@ -42,6 +42,20 @@ async function redSquarePng(size = 64, square = 24): Promise<Buffer> {
   return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
 }
 
+/** 连续渐变色块，用于验证三候选的色号数差异。 */
+async function gradientPng(size = 256): Promise<Buffer> {
+  const raw = Buffer.alloc(size * size * 3);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 3;
+      raw[i] = Math.round((255 * x) / (size - 1));
+      raw[i + 1] = Math.round((255 * y) / (size - 1));
+      raw[i + 2] = (x * 7 + y * 13) % 256;
+    }
+  }
+  return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
+}
+
 function upload(baseUrl: string, image: Buffer): Promise<Response> {
   return fetch(`${baseUrl}/api/generate`, {
     method: 'POST',
@@ -77,8 +91,16 @@ function paletteHex(code: string): string | undefined {
   return mardPalette.find((color) => color.code === code)?.hex;
 }
 
+function postEvent(baseUrl: string, body: unknown): Promise<Response> {
+  return fetch(`${baseUrl}/api/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 describe('云端生成接口', () => {
-  it('返回一张 29×29 的基础档图纸，色号全部落在 MARD 221 内', async () => {
+  it('一次生成返回三张 29×29 的基础档图纸，顺序固定且色号全部落在 MARD 221 内', async () => {
     const baseUrl = await startApp();
     const image = await redSquarePng();
 
@@ -87,7 +109,8 @@ describe('云端生成接口', () => {
 
     expect(task.status).toBe('completed');
     const candidates = task.candidates as Array<any>;
-    expect(candidates).toHaveLength(1);
+    expect(candidates).toHaveLength(3);
+    expect(candidates.map((item) => item.id)).toEqual(['detail', 'color', 'few']);
 
     const candidate = candidates[0];
     expect(candidate.id).toBe('detail');
@@ -111,6 +134,20 @@ describe('云端生成接口', () => {
     for (const item of usage) expect(item.count).toBe(expectedUsage.get(item.code));
     expect(usage.reduce((sum, item) => sum + item.count, 0)).toBe(29 * 29);
 
+    // 三张候选都必须满足同一份结构契约，且色号不越出 221 档
+    for (const item of candidates) {
+      expect(item.paletteTier).toBe('basic');
+      expect(item.width).toBe(29);
+      expect(item.height).toBe(29);
+      const itemCodes = (item.grid as string[][]).flat();
+      for (const code of itemCodes) {
+        expect(code).toMatch(BASE_CODE);
+        expect(paletteHex(code)).toBeDefined();
+      }
+      const itemUsage = item.usage as Array<{ code: string; count: number }>;
+      expect(itemUsage.reduce((sum, entry) => sum + entry.count, 0)).toBe(29 * 29);
+    }
+
     // 主体可辨识：中央红色区域被保留，白底也存在
     const hexOf = new Map((candidate.colors as Array<{ code: string; hex: string }>).map((c) => [c.code, c.hex]));
     const rgbOf = (code: string) => {
@@ -127,6 +164,27 @@ describe('云端生成接口', () => {
     });
     expect(hasRed).toBe(true);
     expect(hasWhite).toBe(true);
+  });
+
+  it('三候选在色号数或降采样策略上互不相同', async () => {
+    const baseUrl = await startApp();
+    const taskId = await submit(baseUrl, await gradientPng());
+    const task = await waitForTask(baseUrl, taskId);
+
+    const candidates = task.candidates as Array<any>;
+    const counts = candidates.map((item) => (item.usage as Array<unknown>).length);
+
+    // 保少色号压到低值，保色彩层次限制在中等值，保主体细节可放开
+    expect(counts[2]).toBeLessThanOrEqual(24);
+    expect(counts[1]).toBeLessThanOrEqual(64);
+    expect(counts[0]).toBeGreaterThan(counts[1]);
+    expect(counts[1]).toBeGreaterThan(counts[2]);
+
+    // 三张图的色号集合必须互不相同
+    const signatures = new Set(
+      candidates.map((item) => (item.usage as Array<{ code: string }>).map((entry) => entry.code).join(',')),
+    );
+    expect(signatures.size).toBe(3);
   });
 
   it('命中内容安全时阻断任务，返回换图提示并留痕', async () => {
@@ -160,15 +218,90 @@ describe('云端生成接口', () => {
     expect(task.failure.message).toContain('换一张');
   });
 
-  it('同一张图重复提交复用同一任务，不重复计算', async () => {
+  it('选中候选与首图接受事件按契约留痕，非法事件被拒绝', async () => {
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      info: (event, data) => events.push({ event, data }),
+      warn: (event, data) => events.push({ event, data }),
+      audit: (event, data) => events.push({ event, data }),
+    };
+    const baseUrl = await startApp(allowAll, logger);
+    const taskId = await submit(baseUrl, await redSquarePng());
+    await waitForTask(baseUrl, taskId);
+
+    const selected = await postEvent(baseUrl, {
+      name: 'candidate_selected',
+      taskId,
+      candidateId: 'color',
+      index: 1,
+    });
+    expect(selected.status).toBe(200);
+    const selectedLog = events.find((event) => event.event === 'candidate_selected');
+    expect(selectedLog?.data).toMatchObject({ taskId, candidateId: 'color', index: 1 });
+    expect(typeof selectedLog?.data?.at).toBe('string');
+
+    const accepted = await postEvent(baseUrl, {
+      name: 'first_pattern_accepted',
+      taskId,
+      candidateId: 'detail',
+      index: 0,
+    });
+    expect(accepted.status).toBe(200);
+    expect(
+      events.some((event) => event.event === 'first_pattern_accepted' && event.data?.candidateId === 'detail'),
+    ).toBe(true);
+
+    // 首图接受只允许第一张
+    const wrongIndex = await postEvent(baseUrl, {
+      name: 'first_pattern_accepted',
+      taskId,
+      candidateId: 'color',
+      index: 1,
+    });
+    expect(wrongIndex.status).toBe(400);
+
+    // 候选与任务结果不匹配
+    const wrongCandidate = await postEvent(baseUrl, {
+      name: 'candidate_selected',
+      taskId,
+      candidateId: 'detail',
+      index: 1,
+    });
+    expect(wrongCandidate.status).toBe(400);
+
+    // 不存在的任务
+    const missingTask = await postEvent(baseUrl, {
+      name: 'candidate_selected',
+      taskId: 'missing-task',
+      candidateId: 'detail',
+      index: 0,
+    });
+    expect(missingTask.status).toBe(400);
+
+    // 未知事件名
+    const unknown = await postEvent(baseUrl, {
+      name: 'whatever',
+      taskId,
+      candidateId: 'detail',
+      index: 0,
+    });
+    expect(unknown.status).toBe(400);
+  });
+
+  it('同一张图重复提交复用同一任务，候选逐字段一致', async () => {
     const baseUrl = await startApp();
     const image = await redSquarePng();
 
     const first = await submit(baseUrl, image);
-    await waitForTask(baseUrl, first);
+    const firstTask = await waitForTask(baseUrl, first);
 
     const second = await submit(baseUrl, image);
     expect(second).toBe(first);
+
+    // 缓存命中后任务已是 completed，再查即得，候选与原任务完全一致
+    const secondTask = await waitForTask(baseUrl, second);
+    expect(secondTask.status).toBe('completed');
+    expect(secondTask.candidates).toEqual(firstTask.candidates);
   });
 
   it('同一张图并发提交只创建一个任务', async () => {

@@ -17,6 +17,7 @@ in the project agent workspace for the rationale and the distribution boundary.
 | `dithering.ts` | `lib/engine/dithering.ts` | Added GPL header comment. |
 | `subject-crop.ts` | `lib/engine/subject-crop.ts` | Added header; `BackgroundMode` import moved from the browser-only `image-loader.ts` to `./types`. |
 | `types.ts` | `lib/types/bead.ts` | Added header; added the `BackgroundMode` type. |
+| `palette-limit.ts` | `lib/engine/palette-limit.ts` | Added header; import path `@/lib/types/bead` → `./types`; comments translated to Chinese. |
 | `LICENSE` | `LICENSE` | Unmodified. |
 
 Browser-dependent upstream modules (`image-loader.ts`, `pattern-recognition.ts`,

@@ -11,9 +11,14 @@ export interface CandidateUsage {
   count: number;
 }
 
+/** 三候选策略：保主体细节 / 保色彩层次 / 保少色号，顺序固定。 */
+export type CandidateId = 'detail' | 'color' | 'few';
+
+/** 候选顺序的唯一来源，生成与埋点校验共用。 */
+export const CANDIDATE_IDS: readonly CandidateId[] = ['detail', 'color', 'few'];
+
 export interface Candidate {
-  /** 候选策略标识；工单 01 只有「保主体细节」一张。 */
-  id: 'detail';
+  id: CandidateId;
   width: number;
   height: number;
   paletteTier: PaletteTier;

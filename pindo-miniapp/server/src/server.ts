@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { ImageDecodeError, decodeImage, generateCandidate } from './generation';
+import { parseAnalyticsEvent } from './analytics';
+import { ImageDecodeError, decodeImage, generateCandidates } from './generation';
 import { consoleLogger, type Logger } from './logger';
 import type { Moderation } from './moderation';
 import { getBasicPalette } from './palette';
@@ -78,7 +79,7 @@ export function createServer(options: ServerOptions): Server {
     store.markProcessing(taskId);
     try {
       const decoded = await decodeImage(image);
-      store.complete(taskId, [generateCandidate(decoded, palette)]);
+      store.complete(taskId, generateCandidates(decoded, palette));
     } catch (error) {
       const failure = failureFor(error);
       if (failure.code === 'internal') {
@@ -108,6 +109,50 @@ export function createServer(options: ServerOptions): Server {
       logger.warn('session_failed', { error: error instanceof Error ? error.message : String(error) });
       sendError(res, 502, 'session-failed', '登录失败，请重试');
     }
+  }
+
+  async function handleEvent(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let raw: Buffer;
+    try {
+      raw = await readBody(req, 4096);
+    } catch {
+      sendError(res, 400, 'invalid-event', '埋点事件格式不正确');
+      return;
+    }
+    let event: ReturnType<typeof parseAnalyticsEvent>;
+    try {
+      event = parseAnalyticsEvent(JSON.parse(raw.toString('utf8') || 'null'));
+    } catch {
+      event = undefined;
+    }
+    if (!event) {
+      sendError(res, 400, 'invalid-event', '埋点事件格式不正确');
+      return;
+    }
+
+    // 事件必须对应已完成任务里真实存在的那张候选，避免伪造「首图接受」。
+    const view = store.toView(event.taskId);
+    const candidate = view?.status === 'completed' ? view.candidates?.[event.index] : undefined;
+    if (!candidate || candidate.id !== event.candidateId) {
+      sendError(res, 400, 'invalid-event', '埋点事件与任务结果不匹配');
+      return;
+    }
+    const owner = store.ownerOf(event.taskId);
+    if (owner) {
+      const token = String(req.headers['x-session-token'] ?? '');
+      if ((token ? session.openIdFor(token) : undefined) !== owner) {
+        sendError(res, 403, 'event-forbidden', '无权上报该任务的事件');
+        return;
+      }
+    }
+
+    logger.audit(event.name, {
+      taskId: event.taskId,
+      candidateId: event.candidateId,
+      index: event.index,
+      at: new Date().toISOString(),
+    });
+    sendJson(res, 200, { ok: true });
   }
 
   async function handleGenerate(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -194,6 +239,11 @@ export function createServer(options: ServerOptions): Server {
 
       if (req.method === 'POST' && url.pathname === '/api/generate') {
         await handleGenerate(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/events') {
+        await handleEvent(req, res);
         return;
       }
 

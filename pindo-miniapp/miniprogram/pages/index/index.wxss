@@ -64,6 +64,61 @@
   color: #9A8F85;
 }
 
+.pick-hint {
+  display: block;
+  padding: 0 8rpx 16rpx;
+  font-size: 26rpx;
+  color: #7A6F66;
+}
+
+.candidate-list {
+  margin-bottom: 8rpx;
+}
+
+.candidate-card {
+  margin-bottom: 16rpx;
+  padding: 16rpx;
+  background: #FFFFFF;
+  border: 3rpx solid #E6DED4;
+  border-radius: 16rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.candidate-card.selected {
+  border-color: #2B2622;
+}
+
+.thumb-canvas {
+  display: block;
+  flex-shrink: 0;
+}
+
+.candidate-info {
+  flex: 1;
+  margin-left: 20rpx;
+  display: flex;
+  flex-direction: column;
+}
+
+.candidate-label {
+  font-size: 28rpx;
+  font-weight: 600;
+}
+
+.candidate-meta {
+  margin-top: 8rpx;
+  font-size: 22rpx;
+  color: #9A8F85;
+}
+
+.candidate-state {
+  flex-shrink: 0;
+  font-size: 24rpx;
+  color: #2B2622;
+}
+
 .summary {
   padding: 16rpx 8rpx 24rpx;
 }

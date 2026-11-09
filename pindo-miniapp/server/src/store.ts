@@ -41,6 +41,11 @@ export class TaskStore {
     return record;
   }
 
+  /** 任务归属的 openId；用于校验埋点调用方与任务所有者一致。 */
+  ownerOf(id: string): string | undefined {
+    return this.tasks.get(id)?.openId;
+  }
+
   markProcessing(id: string): void {
     const record = this.tasks.get(id);
     if (record && record.status === 'queued') record.status = 'processing';

@@ -84,4 +84,21 @@ async function getTask(taskId) {
   throw apiErrorFrom(response, '任务查询失败，请重新生成');
 }
 
-module.exports = { ApiError, generate, getTask };
+// 埋点上报为尽力而为：失败不打断主流程，但把结果交给调用方决定是否重试。
+function reportEvent(name, payload) {
+  const header = { 'content-type': 'application/json' };
+  if (sessionToken) header['x-session-token'] = sessionToken;
+  return new Promise((resolve) => {
+    wx.request({
+      url: `${config.BASE_URL}/api/events`,
+      method: 'POST',
+      data: { ...payload, name },
+      header,
+      timeout: 5000,
+      success: () => resolve(true),
+      fail: () => resolve(false),
+    });
+  });
+}
+
+module.exports = { ApiError, generate, getTask, reportEvent };

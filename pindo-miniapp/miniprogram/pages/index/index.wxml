@@ -27,19 +27,47 @@
   </block>
 
   <block wx:elif="{{stage === 'preview'}}">
-    <view class="summary">
-      <text class="summary-main">{{candidate.width}} × {{candidate.height}}</text>
-      <text class="summary-sub">MARD 221 · {{candidate.colors.length}} 个色号 · 合计 {{candidate.width * candidate.height}} 颗</text>
+    <view class="pick-hint">三个候选，选一张你更愿意照着拼的</view>
+
+    <view class="candidate-list">
+      <view
+        wx:for="{{candidates}}"
+        wx:key="id"
+        class="candidate-card {{index === selectedIndex ? 'selected' : ''}}"
+        data-index="{{index}}"
+        bindtap="selectCandidate"
+      >
+        <canvas
+          type="2d"
+          id="thumb-{{index}}"
+          class="thumb-canvas"
+          style="width: {{thumbSize}}px; height: {{thumbSize}}px;"
+          data-index="{{index}}"
+          bindtap="selectCandidate"
+        ></canvas>
+        <view class="candidate-info">
+          <text class="candidate-label">{{item.label}}</text>
+          <text class="candidate-meta">{{item.colors.length}} 个色号</text>
+        </view>
+        <text class="candidate-state">{{index === selectedIndex ? '已选' : '查看'}}</text>
+      </view>
     </view>
 
-    <scroll-view class="canvas-scroll" scroll-x scroll-y>
-      <canvas
-        type="2d"
-        id="pattern"
-        class="pattern-canvas"
-        style="width: {{canvasSize}}px; height: {{canvasSize}}px;"
-      ></canvas>
-    </scroll-view>
+    <block wx:if="{{candidate}}">
+      <view class="summary">
+        <text class="summary-main">{{candidate.width}} × {{candidate.height}} · {{candidate.label}}</text>
+        <text class="summary-sub">MARD 221 · {{candidate.colors.length}} 个色号 · 合计 {{candidate.width * candidate.height}} 颗</text>
+      </view>
+
+      <scroll-view class="canvas-scroll" scroll-x scroll-y>
+        <canvas
+          type="2d"
+          id="pattern"
+          class="pattern-canvas"
+          style="width: {{canvasSize}}px; height: {{canvasSize}}px;"
+        ></canvas>
+      </scroll-view>
+    </block>
 
     <view class="actions">
       <button class="btn" bindtap="chooseImage">换一张图</button>
