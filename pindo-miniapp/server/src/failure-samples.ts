@@ -26,11 +26,11 @@ export interface FailureSample extends FailureSampleInput {
 export class FailureSampleStore {
   private readonly samples: FailureSample[] = [];
 
-  add(input: FailureSampleInput): FailureSample {
+  add(input: FailureSampleInput, at = Date.now()): FailureSample {
     // 同一任务重复进入不满意只留档第一份，避免重复反馈把样本列表刷满。
     const existing = this.samples.find((sample) => sample.taskId === input.taskId);
     if (existing) return existing;
-    const sample: FailureSample = { id: randomUUID(), createdAt: Date.now(), ...input };
+    const sample: FailureSample = { id: randomUUID(), createdAt: at, ...input };
     this.samples.push(sample);
     while (this.samples.length > MAX_FAILURE_SAMPLES) this.samples.shift();
     return sample;

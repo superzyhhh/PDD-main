@@ -22,6 +22,14 @@ import {
 } from './exports';
 import { consoleLogger, type Logger } from './logger';
 import { MEMBERSHIP_PLANS, MembershipStore, PLAN_IDS, type PlanId } from './membership';
+import {
+  BLIND_TEST_WINNERS,
+  DEFAULT_CHANNEL,
+  MetricsStore,
+  inTimeRange,
+  sanitizeChannel,
+  type BlindTestWinner,
+} from './metrics';
 import type { Moderation } from './moderation';
 import { getAdvancedPalette, getBasicPalette } from './palette';
 import { PaymentUnavailableError, unconfiguredPaymentProvider, type PaymentProvider } from './payment';
@@ -113,6 +121,18 @@ function failureFor(error: unknown): { code: TaskFailureCode; message: string } 
   return { code: 'internal', message: '生成失败，请稍后重试' };
 }
 
+/** 看板时间参数：缺省表示不限，格式非法由调用方回 400。 */
+function parseTimeBound(raw: string | null): { ok: true; value?: number } | { ok: false } {
+  if (raw === null || raw === '') return { ok: true };
+  const value = Date.parse(raw);
+  return Number.isNaN(value) ? { ok: false } : { ok: true, value };
+}
+
+/** 含逗号、引号或换行的字段按 RFC 4180 加引号转义。 */
+function csvEscape(value: string): string {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
 export function createServer(options: ServerOptions): Server {
   const moderation = options.moderation;
   const logger = options.logger ?? consoleLogger;
@@ -123,6 +143,7 @@ export function createServer(options: ServerOptions): Server {
   const memberships = new MembershipStore();
   const failureSamples = new FailureSampleStore();
   const shares = new ShareStore();
+  const metrics = new MetricsStore();
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
@@ -178,6 +199,12 @@ export function createServer(options: ServerOptions): Server {
       store.complete(taskId, candidates);
       // 未登录任务不落库；登录用户在生成完成时自动保存默认候选。
       const owner = store.ownerOf(taskId);
+      metrics.recordGeneration({
+        taskId,
+        openId: owner,
+        channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
+        at: now().getTime(),
+      });
       if (owner) savePattern(owner, taskId, candidates[0]);
     } catch (error) {
       const failure = failureFor(error);
@@ -251,6 +278,14 @@ export function createServer(options: ServerOptions): Server {
       index: event.index,
       at: new Date().toISOString(),
     });
+    if (event.name === 'first_pattern_accepted') {
+      metrics.recordAcceptance({
+        taskId: event.taskId,
+        openId: owner,
+        channel: store.channelOf(event.taskId) ?? DEFAULT_CHANNEL,
+        at: now().getTime(),
+      });
+    }
     sendJson(res, 200, { ok: true });
   }
 
@@ -381,6 +416,7 @@ export function createServer(options: ServerOptions): Server {
         notification.transactionId ?? '',
         now(),
       );
+      if (applied) metrics.recordMembershipActivated(order.openId, now().getTime());
       logger.audit(applied ? 'membership_activated' : 'membership_payment_duplicate', {
         orderId: order.id,
         openId: order.openId,
@@ -410,6 +446,9 @@ export function createServer(options: ServerOptions): Server {
 
     const token = String(req.headers['x-session-token'] ?? '');
     const openId = token ? session.openIdFor(token) : undefined;
+    // 渠道由投放链接带入，非法值统一归为直接访问。
+    const rawChannel = req.headers['x-channel'];
+    const channel = sanitizeChannel(Array.isArray(rawChannel) ? rawChannel[0] : rawChannel);
     if (paletteTier === 'advanced' && !isAdvancedPaletteAllowed(openId)) {
       sendError(res, 403, 'advanced-not-allowed', '291 进阶色卡仅对已开通会员开放');
       return;
@@ -482,7 +521,7 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const task = store.create(key, openId, { sizeTier, paletteTier, settings });
+    const task = store.create(key, openId, { sizeTier, paletteTier, settings }, channel);
     sendJson(res, 202, { taskId: task.id, status: task.status });
     setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier, settings));
   }
@@ -639,7 +678,7 @@ export function createServer(options: ServerOptions): Server {
       candidates: meta.candidates,
       image,
       imageContentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
-    });
+    }, now().getTime());
     logger.audit('failure_sample', {
       sampleId: sample.id,
       taskId,
@@ -683,6 +722,110 @@ export function createServer(options: ServerOptions): Server {
       'cache-control': 'no-store',
     });
     res.end(sample.image);
+  }
+
+  /** 失败样本按创建时间导出 CSV，供运营按验证期区间取数。 */
+  function handleExportFailureSamples(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res)) return;
+    const from = parseTimeBound(url.searchParams.get('from'));
+    const to = parseTimeBound(url.searchParams.get('to'));
+    if (!from.ok || !to.ok) {
+      sendError(res, 400, 'invalid-range', '时间范围格式不正确');
+      return;
+    }
+    const rows = failureSamples
+      .list(MAX_FAILURE_SAMPLES)
+      .filter((sample) => inTimeRange(sample.createdAt, { from: from.value, to: to.value }))
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((sample) =>
+        [
+          sample.id,
+          sample.taskId,
+          sample.openId ?? '',
+          sample.sizeTier,
+          sample.paletteTier,
+          JSON.stringify(sample.settings),
+          new Date(sample.createdAt).toISOString(),
+          `/api/failure-samples/${sample.id}/image`,
+        ]
+          .map(csvEscape)
+          .join(','),
+      );
+    const csv = [
+      'sampleId,taskId,openId,sizeTier,paletteTier,settings,createdAt,imageUrl',
+      ...rows,
+    ].join('\n');
+    const payload = `${csv}\n`;
+    res.writeHead(200, {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-length': String(Buffer.byteLength(payload)),
+      'content-disposition': 'attachment; filename="failure-samples.csv"',
+      'cache-control': 'no-store',
+    });
+    res.end(payload);
+  }
+
+  const dashboardLabels = {
+    disabledCode: 'metrics-disabled',
+    disabledMessage: '验证看板后台未启用',
+    forbiddenMessage: '无权查看验证看板',
+  };
+
+  /** 验证期四闸门的统一取数入口：时间区间 + 可选渠道。 */
+  function handleMetricsSummary(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    const from = parseTimeBound(url.searchParams.get('from'));
+    const to = parseTimeBound(url.searchParams.get('to'));
+    if (!from.ok || !to.ok) {
+      sendError(res, 400, 'invalid-range', '时间范围格式不正确');
+      return;
+    }
+    const channel = url.searchParams.get('channel') || undefined;
+    sendJson(res, 200, metrics.summary({ from: from.value, to: to.value, channel }));
+  }
+
+  async function handleRecordBlindTest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    let body: {
+      testerId?: unknown;
+      group?: unknown;
+      competitor?: unknown;
+      winner?: unknown;
+    };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as typeof body;
+    } catch {
+      sendError(res, 400, 'invalid-blind-test', '盲测记录格式不正确');
+      return;
+    }
+    const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+    const testerId = text(body.testerId);
+    const group = text(body.group);
+    const competitor = text(body.competitor);
+    const winner = text(body.winner);
+    if (
+      !testerId ||
+      testerId.length > 64 ||
+      !group ||
+      group.length > 32 ||
+      !competitor ||
+      competitor.length > 32 ||
+      !BLIND_TEST_WINNERS.includes(winner as BlindTestWinner)
+    ) {
+      sendError(res, 400, 'invalid-blind-test', '盲测记录格式不正确');
+      return;
+    }
+    metrics.recordBlindTest(
+      { testerId, group, competitor, winner: winner as BlindTestWinner },
+      now().getTime(),
+    );
+    sendJson(res, 201, { ok: true });
+  }
+
+  function handleListBlindTests(req: IncomingMessage, res: ServerResponse): void {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    sendJson(res, 200, metrics.blindTestSummary());
   }
 
   /** 分享记录只公开这一张候选快照，不带任务号、账号或其他图纸。 */
@@ -891,6 +1034,7 @@ export function createServer(options: ServerOptions): Server {
       decision = exportStore.decide(key, openId, quotaLimit, now());
     } catch (error) {
       if (error instanceof QuotaExceededError) {
+        metrics.recordQuotaExhausted(openId, now().getTime());
         logger.audit('export_quota_exceeded', {
           taskId,
           candidateId,
@@ -1051,6 +1195,22 @@ export function createServer(options: ServerOptions): Server {
         return;
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/metrics/summary') {
+        handleMetricsSummary(req, res, url);
+        return;
+      }
+
+      if (url.pathname === '/api/metrics/blind-tests') {
+        if (req.method === 'GET') {
+          handleListBlindTests(req, res);
+          return;
+        }
+        if (req.method === 'POST') {
+          await handleRecordBlindTest(req, res);
+          return;
+        }
+      }
+
       if (url.pathname === '/api/patterns') {
         if (req.method === 'GET') {
           handleListPatterns(req, res);
@@ -1073,6 +1233,11 @@ export function createServer(options: ServerOptions): Server {
           handleDeletePattern(req, res, patternId);
           return;
         }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/failure-samples/export') {
+        handleExportFailureSamples(req, res, url);
+        return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/failure-samples') {

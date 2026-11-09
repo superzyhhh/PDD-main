@@ -68,6 +68,9 @@ async function generate(arrayBuffer, options = {}) {
   };
   if (token) header['x-session-token'] = token;
   if (options.settings) header['x-advanced-settings'] = JSON.stringify(options.settings);
+  // 投放渠道在冷启动时由链接参数写入全局，缺失时服务端按直接访问统计。
+  const channel = getApp().globalData.channel;
+  if (channel) header['x-channel'] = channel;
 
   const response = await request({
     url: `${config.BASE_URL}/api/generate`,

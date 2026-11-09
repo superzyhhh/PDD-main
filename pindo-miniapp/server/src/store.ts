@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
+import { DEFAULT_CHANNEL } from './metrics';
 import type {
   Candidate,
   PaletteTier,
@@ -15,6 +16,7 @@ interface TaskRecord {
   id: string;
   contentKey: string;
   openId?: string;
+  channel: string;
   status: TaskStatus;
   candidates?: Candidate[];
   failure?: TaskFailure;
@@ -39,11 +41,17 @@ export class TaskStore {
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly byContent = new Map<string, string>();
 
-  create(contentKey: string, openId?: string, meta?: TaskMeta): TaskRecord {
+  create(
+    contentKey: string,
+    openId?: string,
+    meta?: TaskMeta,
+    channel = DEFAULT_CHANNEL,
+  ): TaskRecord {
     const record: TaskRecord = {
       id: randomUUID(),
       contentKey,
       openId,
+      channel,
       status: 'queued',
       sizeTier: meta?.sizeTier,
       paletteTier: meta?.paletteTier,
@@ -68,6 +76,11 @@ export class TaskStore {
   /** 任务归属的 openId；用于校验埋点调用方与任务所有者一致。 */
   ownerOf(id: string): string | undefined {
     return this.tasks.get(id)?.openId;
+  }
+
+  /** 创建任务时记录的投放渠道，用于看板按渠道归因。 */
+  channelOf(id: string): string | undefined {
+    return this.tasks.get(id)?.channel;
   }
 
   setSavedPattern(id: string, saved: SavedPattern): void {
