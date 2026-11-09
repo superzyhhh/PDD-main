@@ -9,7 +9,7 @@ import {
   type AdvancedSettings,
 } from './advanced-settings';
 import { FailureSampleStore, MAX_FAILURE_SAMPLES } from './failure-samples';
-import { ImageDecodeError, decodeImage, generateCandidates } from './generation';
+import { ImageDecodeError, decodeImage, encodeImage, generateCandidates } from './generation';
 import {
   ExportStore,
   FREE_DAILY_EXPORT_LIMIT,
@@ -37,7 +37,16 @@ import { MAX_PATTERNS, PatternStore, patternSummary } from './patterns';
 import { renderTiledPrintExport } from './print';
 import { createSessionService, type SessionService } from './session';
 import { MAX_SHARES, SHARE_SOURCES, ShareStore, type ShareRecord, type ShareSource } from './shares';
-import { TaskStore } from './store';
+import {
+  DEFAULT_STYLE,
+  STYLE_IDS,
+  STYLE_LABELS,
+  isStyleId,
+  unconfiguredStyleProvider,
+  type StyleId,
+  type StyleProvider,
+} from './style';
+import { TaskStore, type TaskMeta } from './store';
 import {
   PALETTE_TIERS,
   SIZE_TIERS,
@@ -57,6 +66,8 @@ export interface ServerOptions {
   session?: SessionService;
   /** 支付渠道；缺省为未配置，客户端只能看到权益、不能下单。 */
   payment?: PaymentProvider;
+  /** 风格服务；缺省为未配置，风格化能力关闭，原图流程不变。 */
+  style?: StyleProvider;
   /** 测试注入时钟；缺省用系统时间。 */
   now?: () => Date;
   /** 291 进阶档的额外白名单（运营/测试用）；会员资格由服务端会员状态判定。 */
@@ -99,15 +110,12 @@ function readBody(req: IncomingMessage, limit = MAX_UPLOAD_BYTES): Promise<Buffe
   });
 }
 
-function contentKey(
-  buffer: Buffer,
-  sizeTier: string,
-  paletteTier: string,
-  settings: AdvancedSettings,
-): string {
+function contentKey(buffer: Buffer, meta: TaskMeta): string {
   return createHash('sha256')
     .update(buffer)
-    .update(`|${sizeTier}|${paletteTier}|${settingsFingerprint(settings)}`)
+    .update(
+      `|${meta.sizeTier}|${meta.paletteTier}|${settingsFingerprint(meta.settings)}|${meta.style}`,
+    )
     .digest('hex');
 }
 
@@ -146,6 +154,7 @@ export function createServer(options: ServerOptions): Server {
   const metrics = new MetricsStore();
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
+  const styleProvider = options.style ?? unconfiguredStyleProvider;
   /** 同一账号同一图纸的并发导出只渲染一次，避免重复扣次。 */
   const pendingExports = new Map<string, Promise<ExportRecord>>();
   const basicPalette = getBasicPalette();
@@ -181,16 +190,72 @@ export function createServer(options: ServerOptions): Server {
     return result;
   }
 
-  async function runTask(
-    taskId: string,
-    image: Buffer,
-    sizeTier: SizeTier,
-    paletteTier: PaletteTier,
-    settings: AdvancedSettings,
-  ): Promise<void> {
+  /** 风格化失败统一留痕，并以可识别原因结束任务。 */
+  function failStyle(taskId: string, style: StyleId, stage: string, error: unknown): void {
+    logger.warn('style_failed', {
+      taskId,
+      style,
+      stage,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    store.fail(taskId, 'style-failed', '风格化失败，请重试');
+  }
+
+  async function runTask(taskId: string, image: Buffer, meta: TaskMeta): Promise<void> {
+    const { sizeTier, paletteTier, settings, style } = meta;
     store.markProcessing(taskId);
     try {
-      const decoded = await decodeImage(image);
+      const source = await decodeImage(image);
+      let decoded = source;
+      if (style !== 'original') {
+        // 风格化在抠主体之前，拿到的是已摆正、不带 EXIF 的完整画面。
+        let styled;
+        try {
+          styled = await styleProvider.stylize({
+            buffer: await encodeImage(source),
+            contentType: 'image/png',
+            style,
+          });
+        } catch (error) {
+          failStyle(taskId, style, 'provider', error);
+          return;
+        }
+
+        // 风格图输出同样要过内容安全，命中即结束任务，不进入出图。
+        let verdict: 'pass' | 'block' = 'pass';
+        try {
+          verdict = await moderation.check({
+            buffer: styled.buffer,
+            contentType: styled.contentType,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn('moderation_error', { taskId, stage: 'style-output', error: message });
+          logger.audit('moderation_skipped', {
+            taskId,
+            stage: 'style-output',
+            reason: message,
+            at: new Date().toISOString(),
+          });
+        }
+        if (verdict === 'block') {
+          logger.audit('content_blocked', {
+            taskId,
+            stage: 'style-output',
+            at: new Date().toISOString(),
+          });
+          store.fail(taskId, 'style-blocked', '风格化结果不符合内容规范，请换一张图');
+          return;
+        }
+
+        try {
+          decoded = await decodeImage(styled.buffer);
+        } catch (error) {
+          failStyle(taskId, style, 'decode', error);
+          return;
+        }
+      }
+
       const palette = filterPaletteBySeries(
         paletteTier === 'advanced' ? advancedPalette : basicPalette,
         settings.series,
@@ -303,6 +368,10 @@ export function createServer(options: ServerOptions): Server {
     const openId = requestOpenId(req);
     const status = openId ? memberships.statusOf(openId, now()) : undefined;
     const purchaseAvailable = !isIOSPlatform(req) && payment.available;
+    // 风格族是否可用与可选项由服务端下发，不可用时客户端隐藏整组入口。
+    const styleOptions = styleProvider.available
+      ? STYLE_IDS.map((id) => ({ id, label: STYLE_LABELS[id] }))
+      : [];
     sendJson(res, 200, {
       purchaseAvailable,
       plans: purchaseAvailable
@@ -324,6 +393,7 @@ export function createServer(options: ServerOptions): Server {
             expiresAt: new Date(status.expiresAt).toISOString(),
           }
         : null,
+      styles: { available: styleProvider.available, options: styleOptions },
     });
   }
 
@@ -444,6 +514,19 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
+    const rawStyle = req.headers['x-style'];
+    const styleHeader = Array.isArray(rawStyle) ? rawStyle[0] : rawStyle;
+    // 缺省按原图处理；取值固定为六种，非法值直接拒绝。
+    const style = styleHeader === undefined || styleHeader === '' ? DEFAULT_STYLE : styleHeader;
+    if (!isStyleId(style)) {
+      sendError(res, 400, 'invalid-style', '不支持该风格，请重新选择');
+      return;
+    }
+    if (style !== 'original' && !styleProvider.available) {
+      sendError(res, 503, 'style-unavailable', '当前版本暂不支持风格化，请选择原图');
+      return;
+    }
+
     const token = String(req.headers['x-session-token'] ?? '');
     const openId = token ? session.openIdFor(token) : undefined;
     // 渠道由投放链接带入，非法值统一归为直接访问。
@@ -483,19 +566,18 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const key = contentKey(image, sizeTier, paletteTier, settings);
+    const meta: TaskMeta = { sizeTier, paletteTier, settings, style };
+    const key = contentKey(image, meta);
     const reusable = reusableTaskFor(key, openId);
     if (reusable) {
       sendJson(res, 202, { taskId: reusable.id, status: reusable.status });
       return;
     }
 
+    const contentType = String(req.headers['content-type'] ?? 'application/octet-stream');
     let verdict: 'pass' | 'block' = 'pass';
     try {
-      verdict = await moderation.check({
-        buffer: image,
-        contentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
-      });
+      verdict = await moderation.check({ buffer: image, contentType });
     } catch (error) {
       // 内容安全接口异常时放行，但留痕，避免把可用性押在外部接口上。
       const message = error instanceof Error ? error.message : String(error);
@@ -521,9 +603,9 @@ export function createServer(options: ServerOptions): Server {
       return;
     }
 
-    const task = store.create(key, openId, { sizeTier, paletteTier, settings }, channel);
+    const task = store.create(key, openId, meta, channel);
     sendJson(res, 202, { taskId: task.id, status: task.status });
-    setImmediate(() => void runTask(task.id, image, sizeTier, paletteTier, settings));
+    setImmediate(() => void runTask(task.id, image, meta));
   }
 
   /** 取当前登录账号；未登录时回 401 并返回 undefined。 */
@@ -548,7 +630,15 @@ export function createServer(options: ServerOptions): Server {
       sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除');
       return;
     }
-    sendJson(res, 200, { pattern: { ...patternSummary(record), candidate: record.candidate } });
+    const style = store.taskMeta(record.taskId)?.style;
+    sendJson(res, 200, {
+      pattern: {
+        ...patternSummary(record),
+        style,
+        styleLabel: style ? STYLE_LABELS[style] : undefined,
+        candidate: record.candidate,
+      },
+    });
   }
 
   /** 选中其他候选后原地更新同一张图纸，不新增列表条目。 */

@@ -1,4 +1,5 @@
 import type { AdvancedSettings } from './advanced-settings';
+import type { StyleId } from './style';
 
 export const PALETTE_TIERS = ['basic', 'advanced'] as const;
 
@@ -55,7 +56,12 @@ export interface Candidate {
 
 export type TaskStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
-export type TaskFailureCode = 'image-unsupported' | 'image-too-large' | 'internal';
+export type TaskFailureCode =
+  | 'image-unsupported'
+  | 'image-too-large'
+  | 'style-failed'
+  | 'style-blocked'
+  | 'internal';
 
 export interface TaskFailure {
   code: TaskFailureCode;
@@ -72,6 +78,10 @@ export interface TaskView {
   savedPattern?: SavedPattern;
   /** 本次生成实际应用的高级设置，用于客户端明确反馈。 */
   settings?: AdvancedSettings;
+  /** 本次生成实际使用的风格；非原图表示经过了风格服务。 */
+  style?: StyleId;
+  /** 风格的展示文案，与风格选项共用同一份服务端标签。 */
+  styleLabel?: string;
 }
 
 /** 「我的图纸」保存结果；evictedCount 用于提示用户旧图已被清理。 */

@@ -2,6 +2,7 @@ import { createWechatModeration, allowAllModeration } from './moderation';
 import { createSandboxPaymentProvider, unconfiguredPaymentProvider } from './payment';
 import { createServer } from './server';
 import { createSessionService } from './session';
+import { createFakeStyleProvider } from './style';
 
 const port = Number(process.env.PORT ?? 3000);
 const appId = process.env.WX_APP_ID;
@@ -41,10 +42,21 @@ const advancedOpenIds = (process.env.ADVANCED_PALETTE_OPENIDS ?? '')
 const isAdvancedPaletteAllowed = (openId?: string): boolean =>
   !!openId && advancedOpenIds.includes(openId);
 
+// 风格服务：真实厂商凭据到位前仅提供确定性假实现，生产环境禁止误用。
+const styleSandbox = process.env.STYLE_SANDBOX === '1';
+if (styleSandbox && process.env.NODE_ENV === 'production') {
+  throw new Error('生产环境禁止启用 STYLE_SANDBOX');
+}
+const styleProvider = styleSandbox ? createFakeStyleProvider() : undefined;
+if (!styleProvider) {
+  console.warn('[pindo-miniapp] 未配置风格服务，风格族入口关闭，原图生成不受影响');
+}
+
 createServer({
   moderation,
   session,
   payment,
+  style: styleProvider,
   isAdvancedPaletteAllowed,
   adminToken: process.env.ADMIN_TOKEN,
 }).listen(port, () => {

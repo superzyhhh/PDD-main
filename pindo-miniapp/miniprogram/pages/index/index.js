@@ -49,6 +49,11 @@ Page({
     hasImage: false,
     sizeTier: 'small',
     paletteTier: 'basic',
+    style: 'original',
+    styleAvailable: false,
+    styleOptions: [],
+    styleLabel: '',
+    aiStyled: false,
     advancedOpen: false,
     advanced: { ...DEFAULT_ADVANCED_SETTINGS },
     advancedDirty: false,
@@ -104,6 +109,7 @@ Page({
   /** 没有选中候选时没有可分享的图纸，先收起右上角转发入口。 */
   onLoad() {
     wx.hideShareMenu();
+    this.loadStyles();
   },
 
   onUnload() {
@@ -144,6 +150,24 @@ Page({
     wx.navigateTo({ url: '/pages/patterns/patterns' });
   },
 
+  /** 风格族可用性与选项由权益接口下发；不可用时隐藏整组入口。 */
+  async loadStyles() {
+    try {
+      const info = await api.getMembership(isIOS() ? 'ios' : 'android');
+      const styles = info && info.styles;
+      const options =
+        styles && styles.available && Array.isArray(styles.options) ? styles.options : [];
+      this.setData({
+        styleAvailable: options.length > 0,
+        styleOptions: options,
+        // 入口关闭时回落到原图，避免带着不可用的风格提交。
+        style: options.some((item) => item.id === this.data.style) ? this.data.style : 'original',
+      });
+    } catch {
+      this.setData({ styleAvailable: false, styleOptions: [], style: 'original' });
+    }
+  },
+
   /** 用服务端保存的快照重新打开一张旧图纸；导出走 patternId，缓存命中不重复扣次。 */
   async openSavedPattern(patternId) {
     this.cancelPoll();
@@ -176,6 +200,9 @@ Page({
         taskId: result.pattern.taskId || '',
         patternId,
         previewHint: REOPEN_HINT,
+        // 快照可能因任务淘汰而没有风格信息，此时不展示风格标识。
+        styleLabel: result.pattern.styleLabel || '',
+        aiStyled: !!result.pattern.style && result.pattern.style !== 'original',
         candidates: [labeled],
         selectedIndex: 0,
         candidate: labeled,
@@ -195,6 +222,12 @@ Page({
 
   selectSize(event) {
     this.setData({ sizeTier: event.currentTarget.dataset.id });
+  },
+
+  selectStyle(event) {
+    const id = event.currentTarget.dataset.id;
+    if (!id) return;
+    this.setData({ style: id });
   },
 
   selectPalette(event) {
@@ -330,6 +363,7 @@ Page({
       const task = await api.generate(this.imageBuffer, {
         sizeTier: this.data.sizeTier,
         paletteTier: this.data.paletteTier,
+        style: this.data.style,
         settings: this.data.advanced,
       });
       this.setData({
@@ -349,9 +383,17 @@ Page({
           seriesOptions: seriesOptionsFor(advanced.series, 'basic'),
         });
       }
+      // 风格入口被服务端判定不可用时回落到原图并隐藏，下次生成仍可继续。
+      const styleFallback = error.code === 'style-unavailable';
+      if (styleFallback) {
+        this.setData({ style: 'original', styleAvailable: false, styleOptions: [] });
+      }
       this.showError(
         error.message,
-        fallback || error.code === 'network' || error.code === 'internal',
+        fallback ||
+          styleFallback ||
+          error.code === 'network' ||
+          error.code === 'internal',
       );
     }
   },
@@ -367,7 +409,10 @@ Page({
         }
         if (task.status === 'failed') {
           const failure = task.failure || {};
-          const retryable = failure.code !== 'image-unsupported' && failure.code !== 'image-too-large';
+          const retryable =
+            failure.code !== 'image-unsupported' &&
+            failure.code !== 'image-too-large' &&
+            failure.code !== 'style-blocked';
           this.showError(failure.message || '生成失败，请稍后重试', retryable);
           return;
         }
@@ -403,12 +448,16 @@ Page({
     const thumbCell = Math.max(1, Math.floor(THUMB_WIDTH / list[0].width));
     const thumbSize = list[0].width * thumbCell;
     const applied = task.settings || DEFAULT_ADVANCED_SETTINGS;
+    const style = task.style || 'original';
     this.setData({
       stage: 'preview',
       message: '',
       canRetry: false,
       patternId: '',
       previewHint: DEFAULT_PICK_HINT,
+      style,
+      styleLabel: task.styleLabel || '',
+      aiStyled: style !== 'original',
       candidates: list,
       selectedIndex: -1,
       candidate: null,

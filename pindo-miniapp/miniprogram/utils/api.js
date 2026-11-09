@@ -65,6 +65,7 @@ async function generate(arrayBuffer, options = {}) {
     'content-type': 'application/octet-stream',
     'x-size-tier': options.sizeTier || 'small',
     'x-palette-tier': options.paletteTier || 'basic',
+    'x-style': options.style || 'original',
   };
   if (token) header['x-session-token'] = token;
   if (options.settings) header['x-advanced-settings'] = JSON.stringify(options.settings);

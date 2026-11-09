@@ -97,6 +97,15 @@ export async function decodeImage(buffer: Buffer): Promise<DecodedImage> {
   }
 }
 
+/** 把已解码并摆正的图像重新编码成 PNG，供风格服务使用（不带原始 EXIF）。 */
+export async function encodeImage(image: DecodedImage): Promise<Buffer> {
+  return sharp(image.data, {
+    raw: { width: image.width, height: image.height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
+}
+
 /**
  * 抠主体一次，按尺寸档与色卡档、三套策略各出一张图纸；返回值顺序即展示顺序。
  */

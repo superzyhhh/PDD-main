@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
 import { DEFAULT_CHANNEL } from './metrics';
+import { DEFAULT_STYLE, STYLE_LABELS, type StyleId } from './style';
 import type {
   Candidate,
   PaletteTier,
@@ -24,6 +25,7 @@ interface TaskRecord {
   sizeTier?: SizeTier;
   paletteTier?: PaletteTier;
   settings?: AdvancedSettings;
+  style?: StyleId;
   createdAt: number;
 }
 
@@ -32,6 +34,7 @@ export interface TaskMeta {
   sizeTier: SizeTier;
   paletteTier: PaletteTier;
   settings: AdvancedSettings;
+  style: StyleId;
 }
 
 const MAX_TASKS = 200;
@@ -56,6 +59,7 @@ export class TaskStore {
       sizeTier: meta?.sizeTier,
       paletteTier: meta?.paletteTier,
       settings: meta?.settings,
+      style: meta?.style,
       createdAt: Date.now(),
     };
     this.tasks.set(record.id, record);
@@ -89,7 +93,9 @@ export class TaskStore {
   }
 
   /** 任务创建时的生成参数与结果快照；用于失败样本留档。 */
-  taskMeta(id: string): (TaskMeta & { openId?: string; status: TaskStatus; candidates?: Candidate[] }) | undefined {
+  taskMeta(id: string):
+    | (TaskMeta & { openId?: string; status: TaskStatus; candidates?: Candidate[] })
+    | undefined {
     const record = this.tasks.get(id);
     if (!record) return undefined;
     return {
@@ -98,6 +104,7 @@ export class TaskStore {
       sizeTier: record.sizeTier ?? 'small',
       paletteTier: record.paletteTier ?? 'basic',
       settings: record.settings ?? DEFAULT_ADVANCED_SETTINGS,
+      style: record.style ?? DEFAULT_STYLE,
       candidates: record.candidates,
     };
   }
@@ -129,6 +136,10 @@ export class TaskStore {
     if (record.failure) view.failure = record.failure;
     if (record.savedPattern) view.savedPattern = record.savedPattern;
     if (record.settings) view.settings = record.settings;
+    if (record.style) {
+      view.style = record.style;
+      view.styleLabel = STYLE_LABELS[record.style];
+    }
     return view;
   }
 

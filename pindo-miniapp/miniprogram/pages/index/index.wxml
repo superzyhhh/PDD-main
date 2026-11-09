@@ -122,6 +122,20 @@
       </view>
     </view>
 
+    <view wx:if="{{styleAvailable}}" class="option-block">
+      <text class="option-title">风格族</text>
+      <view class="chips wrap">
+        <view
+          wx:for="{{styleOptions}}"
+          wx:key="id"
+          class="chip {{style === item.id ? 'active' : ''}}"
+          data-id="{{item.id}}"
+          bindtap="selectStyle"
+        >{{item.label}}</view>
+      </view>
+      <text class="notice">非原图风格会先做 AI 风格化，再生成拼豆图纸</text>
+    </view>
+
     <view class="dropzone" bindtap="chooseImage">
       <text class="drop-title">选择一张图片</text>
       <text class="drop-hint">JPG / PNG，不超过 10MB</text>
@@ -146,6 +160,7 @@
   <block wx:elif="{{stage === 'preview'}}">
     <view class="pick-hint">{{previewHint}}</view>
     <text wx:if="{{appliedSettings}}" class="notice applied">{{appliedSettings}}</text>
+    <text wx:if="{{styleLabel}}" class="notice">风格：{{styleLabel}}{{aiStyled ? ' · AI 风格化' : ''}}</text>
 
     <view class="candidate-list">
       <view
