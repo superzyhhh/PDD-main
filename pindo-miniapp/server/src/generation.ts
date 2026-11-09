@@ -1,5 +1,6 @@
 import sharp from 'sharp';
 import { DEFAULT_ADVANCED_SETTINGS, type AdvancedSettings } from './advanced-settings';
+import { buildMaterials } from './materials';
 import { downscale, type DownscaledPixel, type PixelationMode } from './vendor/pindo-engine/downscaler';
 import { matchColor, matchColors } from './vendor/pindo-engine/color-matcher';
 import { applyDithering } from './vendor/pindo-engine/dithering';
@@ -173,6 +174,7 @@ function buildCandidate(
     const color = targetPalette.find((item) => item.code === code)!;
     return { code, name: color.name, hex: color.hex };
   });
+  const usageEntries = usedCodes.map((code) => ({ code, count: usage.get(code)! }));
 
   return {
     id: strategy.id,
@@ -181,7 +183,8 @@ function buildCandidate(
     boardCount,
     paletteTier,
     grid,
-    usage: usedCodes.map((code) => ({ code, count: usage.get(code)! })),
+    usage: usageEntries,
     colors,
+    materials: buildMaterials(usageEntries, colors, paletteTier),
   };
 }

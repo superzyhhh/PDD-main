@@ -161,6 +161,34 @@ describe('云端生成接口', () => {
       }
       const itemUsage = item.usage as Array<{ code: string; count: number }>;
       expect(itemUsage.reduce((sum, entry) => sum + entry.count, 0)).toBe(29 * 29);
+
+      // 从色号矩阵独立重算用量，逐色号与清单对齐
+      const grid = item.grid as string[][];
+      const recounted = new Map<string, number>();
+      for (const row of grid) {
+        for (const code of row) recounted.set(code, (recounted.get(code) ?? 0) + 1);
+      }
+      expect([...recounted.keys()].sort()).toEqual(itemUsage.map((entry) => entry.code));
+      for (const entry of itemUsage) expect(entry.count).toBe(recounted.get(entry.code));
+
+      // 材料包清单必须逐色号对应用量，包数按 1000 颗一包向上取整
+      const materials = item.materials as Array<{
+        code: string;
+        name: string;
+        hex: string;
+        count: number;
+        packages: number;
+        extraPurchase: boolean;
+      }>;
+      expect(materials.map((material) => material.code)).toEqual(itemUsage.map((entry) => entry.code));
+      for (const material of materials) {
+        const usageEntry = itemUsage.find((entry) => entry.code === material.code)!;
+        expect(material.count).toBe(usageEntry.count);
+        expect(material.packages).toBe(Math.ceil(usageEntry.count / 1000));
+        expect(material.extraPurchase).toBe(false);
+        expect(material.name).toBeTruthy();
+        expect(material.hex).toMatch(/^#[0-9A-F]{6}$/);
+      }
     }
 
     // 主体可辨识：中央红色区域被保留，白底也存在

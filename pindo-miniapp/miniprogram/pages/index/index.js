@@ -93,6 +93,10 @@ Page({
     candidate: null,
     canvasSize: 0,
     thumbSize: 0,
+    materialPackCount: 0,
+    materialExtraCount: 0,
+    materialExtraPacks: 0,
+    materialListHeight: 0,
     exporting: false,
     exportingType: '',
   },
@@ -150,6 +154,7 @@ Page({
         candidate: labeled,
         canvasSize: labeled.width * cell,
         thumbSize: labeled.width * thumbCell,
+        ...materialSummary(labeled),
       });
       wx.nextTick(() => {
         this.paint('#thumb-0', labeled, thumbCell, false);
@@ -380,6 +385,10 @@ Page({
       candidate: null,
       canvasSize: 0,
       thumbSize,
+      materialPackCount: 0,
+      materialExtraCount: 0,
+      materialExtraPacks: 0,
+      materialListHeight: 0,
       advanced: applied,
       maxColorsId: String(applied.maxColors),
       seriesOptions: seriesOptionsFor(applied.series, this.data.paletteTier),
@@ -413,6 +422,7 @@ Page({
       selectedIndex: index,
       candidate,
       canvasSize: candidate.width * cell,
+      ...materialSummary(candidate),
     });
     wx.nextTick(() => this.paint('#pattern', candidate, cell, true));
     this.reportSelection(index, candidate);
@@ -560,6 +570,31 @@ Page({
     }
   },
 
+  /** 材料包外部购买路径：配置购买地址则跳转 web-view，否则复制清单兜底。 */
+  goPurchase() {
+    const candidate = this.data.candidate;
+    const materials = candidate && candidate.materials;
+    if (!materials || !materials.length) return;
+    if (config.PURCHASE_URL && /^https:\/\//.test(config.PURCHASE_URL)) {
+      wx.navigateTo({ url: '/pages/purchase/purchase' });
+      return;
+    }
+    const text = materials
+      .map((item) => `${item.code} ${item.name} ${item.count}颗 ${item.packages}包`)
+      .join('\n');
+    wx.setClipboardData({
+      data: `MARD 拼豆材料包清单\n${text}`,
+      success: () => {
+        wx.showModal({
+          title: '清单已复制',
+          content: '打开购物 App 粘贴搜索，即可按色号购买材料包。',
+          showCancel: false,
+          confirmText: '知道了',
+        });
+      },
+    });
+  },
+
   showQuotaDialog(message) {
     if (isIOS()) {
       // ADR-0003：iOS 不出现购买入口或虚拟商品文案。
@@ -697,6 +732,19 @@ function contentTypeForPath(path) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 材料包清单汇总：总包数、需额外采购的色号数与包数。 */
+function materialSummary(candidate) {
+  const materials = candidate.materials || [];
+  const extra = materials.filter((item) => item.extraPurchase);
+  return {
+    materialPackCount: materials.reduce((sum, item) => sum + item.packages, 0),
+    materialExtraCount: extra.length,
+    materialExtraPacks: extra.reduce((sum, item) => sum + item.packages, 0),
+    // 每行约 64rpx，超过 10 行后改为列表内滚动，避免把导出按钮挤出屏幕。
+    materialListHeight: Math.min(Math.max(materials.length * 64, 64), 640),
+  };
 }
 
 /**

@@ -8,8 +8,14 @@ export const BACKGROUND_SETTINGS = ['auto', 'keep'] as const;
 
 export const DOWNSCALE_SETTINGS = ['auto', 'average', 'edge-aware', 'dominant'] as const;
 
+/** MARD 基础档（221）系列：A–H 彩色与 M 灰阶。 */
+export const BASIC_SERIES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M'] as const;
+
+/** 进阶档（291）在基础档之外追加的系列。 */
+export const ADVANCED_SERIES = ['P', 'Q', 'R', 'T', 'Y', 'ZG'] as const;
+
 /** MARD 色号系列：A–H 基础、M 灰阶、P/Q/R/T/Y 与 ZG 进阶。 */
-export const SERIES_CODES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M', 'P', 'Q', 'R', 'T', 'Y', 'ZG'] as const;
+export const SERIES_CODES = [...BASIC_SERIES, ...ADVANCED_SERIES] as const;
 
 export const MIN_ADVANCED_MAX_COLORS = 4;
 

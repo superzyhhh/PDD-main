@@ -189,6 +189,27 @@
         ></canvas>
       </scroll-view>
 
+      <view wx:if="{{candidate && candidate.materials.length}}" class="materials">
+        <view class="materials-head">
+          <view class="materials-title-wrap">
+            <text class="materials-title">材料包清单</text>
+            <text class="materials-sub">共 {{materialPackCount}} 包 · 每包 1000 颗</text>
+          </view>
+          <view class="materials-buy" bindtap="goPurchase">去购买</view>
+        </view>
+        <text wx:if="{{materialExtraCount > 0}}" class="notice notice-advanced">其中 {{materialExtraCount}} 个色号不在 MARD 221 套装内，需额外采购 {{materialExtraPacks}} 包</text>
+        <scroll-view class="materials-list" scroll-y style="height: {{materialListHeight}}rpx;">
+          <view wx:for="{{candidate.materials}}" wx:key="code" class="material-row">
+            <view class="material-dot" style="background: {{item.hex}};"></view>
+            <text class="material-code">{{item.code}}</text>
+            <text class="material-name">{{item.name}}</text>
+            <text class="material-count">{{item.count}} 颗</text>
+            <text class="material-packs">{{item.packages}} 包</text>
+            <text wx:if="{{item.extraPurchase}}" class="material-extra">额外</text>
+          </view>
+        </scroll-view>
+      </view>
+
       <button
         class="btn primary export-btn"
         loading="{{exporting && exportingType === 'hd'}}"

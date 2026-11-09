@@ -19,6 +19,18 @@ export interface CandidateUsage {
   count: number;
 }
 
+/** 材料包清单的一行：按色号核对用量并换算整包数。 */
+export interface CandidateMaterial {
+  code: string;
+  name: string;
+  hex: string;
+  count: number;
+  /** 按每包 1000 颗换算的整包数。 */
+  packages: number;
+  /** 291 档下该色号不在 221 套装内，需要额外采购。 */
+  extraPurchase: boolean;
+}
+
 /** 三候选策略：保主体细节 / 保色彩层次 / 保少色号，顺序固定。 */
 export type CandidateId = 'detail' | 'color' | 'few';
 
@@ -37,6 +49,8 @@ export interface Candidate {
   usage: CandidateUsage[];
   /** 本图纸用到的色号及其颜色信息，供端侧渲染。 */
   colors: CandidateColor[];
+  /** 材料包清单，顺序与 usage 一致。 */
+  materials: CandidateMaterial[];
 }
 
 export type TaskStatus = 'queued' | 'processing' | 'completed' | 'failed';

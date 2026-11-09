@@ -1,0 +1,6 @@
+<web-view wx:if="{{url}}" src="{{url}}"></web-view>
+
+<view wx:else class="state">
+  <text class="state-title">尚未配置材料包购买地址</text>
+  <text class="state-hint">请在图纸详情复制清单，到购物 App 按色号搜索购买</text>
+</view>

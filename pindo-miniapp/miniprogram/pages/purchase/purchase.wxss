@@ -1,0 +1,22 @@
+.state {
+  margin: 160rpx 48rpx;
+  padding: 48rpx 32rpx;
+  background: #FFFFFF;
+  border-radius: 24rpx;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.state-title {
+  font-size: 30rpx;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.state-hint {
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  color: #9A8F85;
+  text-align: center;
+}

@@ -255,6 +255,99 @@
   color: #7A6F66;
 }
 
+.materials {
+  margin: 8rpx 0 16rpx;
+  padding: 20rpx;
+  background: #FFFFFF;
+  border-radius: 20rpx;
+}
+
+.materials-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.materials-title {
+  display: block;
+  font-size: 28rpx;
+  font-weight: 600;
+}
+
+.materials-sub {
+  display: block;
+  margin-top: 6rpx;
+  font-size: 22rpx;
+  color: #9A8F85;
+}
+
+.materials-buy {
+  padding: 10rpx 24rpx;
+  border: 2rpx solid #2B2622;
+  border-radius: 999rpx;
+  font-size: 24rpx;
+}
+
+.materials .notice {
+  padding: 12rpx 0 0;
+}
+
+.materials-list {
+  margin-top: 12rpx;
+}
+
+.material-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 14rpx 0;
+  border-bottom: 2rpx solid #F0EAE3;
+  font-size: 24rpx;
+}
+
+.material-dot {
+  width: 28rpx;
+  height: 28rpx;
+  margin-right: 12rpx;
+  border-radius: 8rpx;
+  border: 2rpx solid #E6DED4;
+  flex-shrink: 0;
+}
+
+.material-code {
+  width: 96rpx;
+  font-weight: 600;
+}
+
+.material-name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #7A6F66;
+}
+
+.material-count {
+  width: 140rpx;
+  text-align: right;
+  color: #7A6F66;
+}
+
+.material-packs {
+  width: 100rpx;
+  text-align: right;
+}
+
+.material-extra {
+  margin-left: 12rpx;
+  padding: 2rpx 10rpx;
+  border-radius: 8rpx;
+  background: #F6E7DA;
+  color: #A15C2B;
+  font-size: 20rpx;
+}
+
 .canvas-scroll {
   width: 100%;
   height: 900rpx;

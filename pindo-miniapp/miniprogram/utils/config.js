@@ -6,4 +6,6 @@ module.exports = {
   POLL_INTERVAL_MS: 800,
   POLL_TIMEOUT_MS: 30000,
   MAX_IMAGE_BYTES: 10 * 1024 * 1024,
+  // 材料包外部购买地址；上线需在小程序后台配置为业务域名。留空时「去购买」改为复制清单。
+  PURCHASE_URL: '',
 };
