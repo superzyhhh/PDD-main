@@ -549,8 +549,31 @@ async function redCirclePng(size = 96): Promise<Buffer> {
   return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
 }
 
-/** 候选图纸上非白格网的面积占比与连通块数量。 */
-function gridStats(candidate: any): { ratio: number; components: number } {
+/** 白底矩形线框：模拟用户上传的线稿。 */
+async function lineArtPng(
+  size = 96,
+  stroke = 4,
+  ink: [number, number, number] = [20, 20, 20],
+): Promise<Buffer> {
+  const raw = Buffer.alloc(size * size * 3, 255);
+  const inset = Math.round(size * 0.2);
+  const limit = size - inset;
+  for (let y = inset; y < limit; y++) {
+    for (let x = inset; x < limit; x++) {
+      const onBorder =
+        x < inset + stroke || x >= limit - stroke || y < inset + stroke || y >= limit - stroke;
+      if (!onBorder) continue;
+      const i = (y * size + x) * 3;
+      raw[i] = ink[0];
+      raw[i + 1] = ink[1];
+      raw[i + 2] = ink[2];
+    }
+  }
+  return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
+}
+
+/** 候选图纸上非白格网的面积占比、连通块数量与包围盒跨度。 */
+function gridStats(candidate: any): { ratio: number; components: number; bboxSpan: number } {
   const hex = new Map<string, string>(
     (candidate.colors as Array<{ code: string; hex: string }>).map((color) => [
       color.code,
@@ -569,10 +592,18 @@ function gridStats(candidate: any): { ratio: number; components: number } {
   const seen = grid.map((row) => row.map(() => false));
   let subject = 0;
   let components = 0;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       if (!isSubject(x, y)) continue;
       subject += 1;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
       if (seen[y][x]) continue;
       components += 1;
       const stack: Array<[number, number]> = [[x, y]];
@@ -594,7 +625,9 @@ function gridStats(candidate: any): { ratio: number; components: number } {
       }
     }
   }
-  return { ratio: subject / (width * height), components };
+  const bboxSpan =
+    maxX < 0 ? 0 : Math.max((maxX - minX + 1) / width, (maxY - minY + 1) / height);
+  return { ratio: subject / (width * height), components, bboxSpan };
 }
 
 describe('风格转换流水线', () => {
@@ -655,5 +688,60 @@ describe('风格转换流水线', () => {
     const original = gridStats(plain.candidates[0]);
     expect(chibi.ratio).toBeGreaterThan(original.ratio * 0.9);
     expect(chibi.components).toBe(1);
+  });
+});
+
+describe('线条风', () => {
+  it('照片走边缘提取：三候选、尺寸档与色卡档不变，轮廓覆盖主体且不碎', async () => {
+    const baseUrl = await startApp();
+
+    const task = await waitForTask(baseUrl, await submit(baseUrl, await redCirclePng(), { style: 'line' }));
+
+    expect(task.candidates).toHaveLength(3);
+    for (const candidate of task.candidates as Array<any>) {
+      expect(candidate.width).toBe(29);
+      expect(candidate.height).toBe(29);
+      expect(candidate.boardCount).toBe(1);
+      expect(candidate.paletteTier).toBe('basic');
+    }
+    const outline = gridStats(task.candidates[0]);
+    // 轮廓仍覆盖主体范围，但只保留线条而不是实心剪影，也不能整张空白。
+    expect(outline.bboxSpan).toBeGreaterThan(0.8);
+    expect(outline.ratio).toBeGreaterThan(0.02);
+    expect(outline.ratio).toBeLessThan(0.7);
+    expect(gridStats(task.candidates[2]).components).toBe(1);
+  });
+
+  it('线稿输入幂等：黑白与彩色线稿都不会被重复描边加粗', async () => {
+    const baseUrl = await startApp();
+    const cases: Array<[string, [number, number, number]]> = [
+      ['黑白线稿', [20, 20, 20]],
+      ['彩色线稿', [30, 60, 200]],
+    ];
+
+    for (const [label, ink] of cases) {
+      const image = await lineArtPng(96, 4, ink);
+      const styled = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'line' }));
+      const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+      const styledInk = gridStats(styled.candidates[2]).ratio;
+      const plainInk = gridStats(plain.candidates[2]).ratio;
+      expect(styledInk, label).toBeGreaterThan(0);
+      // 描边没有叠加成双线：线条覆盖面积与原图基本一致。
+      expect(styledInk, label).toBeLessThanOrEqual(plainInk * 1.6);
+      expect(styledInk, label).toBeGreaterThanOrEqual(plainInk * 0.6);
+    }
+  });
+
+  it('与其他风格互不复用，换风格产生不同图纸', async () => {
+    const baseUrl = await startApp();
+    const image = await redCirclePng();
+
+    const line = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'line' }));
+    const chibi = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'chibi' }));
+    const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+    expect(line.candidates[0].grid).not.toEqual(chibi.candidates[0].grid);
+    expect(line.candidates[0].grid).not.toEqual(plain.candidates[0].grid);
   });
 });

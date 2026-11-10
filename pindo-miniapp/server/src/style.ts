@@ -138,7 +138,7 @@ export const unconfiguredStyleProvider: StyleProvider = {
 };
 
 /** 本地算法版本；算法一改动就需要让旧缓存失效。 */
-export const LOCAL_STYLE_VERSION = 'local-v2';
+export const LOCAL_STYLE_VERSION = 'local-v3';
 
 /**
  * 风格工作尺寸：最大成品格网（87）的 4 倍，与成品尺寸档解耦，
@@ -172,11 +172,35 @@ export async function encodeStyleInput(image: {
     .toBuffer();
 }
 
+/** 3×3 均值平滑（单通道），压掉噪点，让边缘与色块更稳。 */
+function boxBlur3(input: Float32Array, width: number, height: number): Float32Array {
+  const output = new Float32Array(input.length);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let sum = 0;
+      let count = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          sum += input[ny * width + nx];
+          count += 1;
+        }
+      }
+      output[y * width + x] = sum / count;
+    }
+  }
+  return output;
+}
+
+/** 轮廓墨色，Q 版与线条风共用。 */
+const OUTLINE_RGB = [40, 40, 40] as const;
+
 /** Q 版使用的色阶数量，压掉连续色阶让色块更整。 */
 const CHIBI_LEVELS = 5;
 
-/** Q 版轮廓色与粗细；工作图为成品小档格网的 12 倍，6px 约半个成品格。 */
-const CHIBI_OUTLINE_RGB = [45, 45, 45] as const;
+/** Q 版轮廓粗细；工作图为成品小档格网的 12 倍，6px 约半个成品格。 */
 const CHIBI_OUTLINE_WIDTH = 6;
 const CHIBI_EDGE_THRESHOLD = 20;
 
@@ -190,29 +214,11 @@ async function renderChibi(input: Buffer): Promise<Buffer> {
 
   // 3×3 均值平滑：压掉照片噪点，让色块连通不碎。
   const smooth = new Float32Array(width * height * 3);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let count = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const i = (ny * width + nx) * channels;
-          r += data[i];
-          g += data[i + 1];
-          b += data[i + 2];
-          count += 1;
-        }
-      }
-      const o = (y * width + x) * 3;
-      smooth[o] = r / count;
-      smooth[o + 1] = g / count;
-      smooth[o + 2] = b / count;
-    }
+  for (let channel = 0; channel < 3; channel++) {
+    const values = new Float32Array(width * height);
+    for (let p = 0; p < values.length; p++) values[p] = data[p * channels + channel];
+    const blurred = boxBlur3(values, width, height);
+    for (let p = 0; p < blurred.length; p++) smooth[p * 3 + channel] = blurred[p];
   }
 
   // 每通道 5 级量化：拼豆色号更少，色块边界更清晰。
@@ -231,9 +237,9 @@ async function renderChibi(input: Buffer): Promise<Buffer> {
         const ny = y + dy;
         if (nx >= width || ny >= height) continue;
         const o = (ny * width + nx) * 3;
-        result[o] = CHIBI_OUTLINE_RGB[0];
-        result[o + 1] = CHIBI_OUTLINE_RGB[1];
-        result[o + 2] = CHIBI_OUTLINE_RGB[2];
+        result[o] = OUTLINE_RGB[0];
+        result[o + 1] = OUTLINE_RGB[1];
+        result[o + 2] = OUTLINE_RGB[2];
       }
     }
   };
@@ -256,6 +262,147 @@ async function renderChibi(input: Buffer): Promise<Buffer> {
     .toBuffer();
 }
 
+/** 线条风判定：白底占比下限，以及非白像素里允许出现的大块实心区域比例上限。 */
+const LINE_ART_WHITE_RATIO = 0.4;
+const LINE_ART_CORE_RATIO = 0.1;
+const LINE_ART_CORE_RADIUS = 12;
+
+/** 线条风描边：常规/低对比度两档边缘阈值，描边粗细按成品小档格网可辨识来定。 */
+const LINE_EDGE_THRESHOLD = 110;
+const LINE_EDGE_LOW_THRESHOLD = 45;
+const LINE_EDGE_MIN_RATIO = 0.002;
+const LINE_STROKE_RADIUS = 4;
+
+/**
+ * 线稿判定：白底占多数，且非白像素几乎都是细线条（没有大块实心区域）。
+ * 用积分图判断每个非白像素周围是否有整块非白区域，避免依赖彩度而漏判彩色线稿。
+ */
+function isLineArt(mask: Uint8Array, width: number, height: number, whiteRatio: number): boolean {
+  if (whiteRatio < LINE_ART_WHITE_RATIO) return false;
+
+  const stride = width + 1;
+  const integral = new Uint32Array(stride * (height + 1));
+  for (let y = 0; y < height; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < width; x++) {
+      rowSum += mask[y * width + x];
+      integral[(y + 1) * stride + x + 1] = integral[y * stride + x + 1] + rowSum;
+    }
+  }
+  const windowSum = (x0: number, y0: number, x1: number, y1: number): number =>
+    integral[(y1 + 1) * stride + x1 + 1] -
+    integral[y0 * stride + x1 + 1] -
+    integral[(y1 + 1) * stride + x0] +
+    integral[y0 * stride + x0];
+
+  let nonWhite = 0;
+  let core = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!mask[y * width + x]) continue;
+      nonWhite += 1;
+      const x0 = Math.max(0, x - LINE_ART_CORE_RADIUS);
+      const y0 = Math.max(0, y - LINE_ART_CORE_RADIUS);
+      const x1 = Math.min(width - 1, x + LINE_ART_CORE_RADIUS);
+      const y1 = Math.min(height - 1, y + LINE_ART_CORE_RADIUS);
+      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+      if (windowSum(x0, y0, x1, y1) === area) core += 1;
+    }
+  }
+  return nonWhite === 0 || core / nonWhite <= LINE_ART_CORE_RATIO;
+}
+
+/**
+ * 线条风：已是线稿时原样保留（避免重复描边出现双线），
+ * 否则用 Sobel 提取边缘并加粗描边，输出白底线条图。
+ */
+async function renderLine(input: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(input)
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  const total = width * height;
+
+  const gray = new Float32Array(total);
+  const mask = new Uint8Array(total);
+  let whiteCount = 0;
+  for (let p = 0; p < total; p++) {
+    const i = p * channels;
+    const value = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    gray[p] = value;
+    if (value >= 235) {
+      whiteCount += 1;
+    } else {
+      mask[p] = 1;
+    }
+  }
+
+  if (isLineArt(mask, width, height, whiteCount / total)) {
+    return sharp(input).grayscale().png().toBuffer();
+  }
+
+  // 平滑后取 Sobel 梯度，弱边缘被阈值滤掉，只留主体轮廓。
+  const smooth = boxBlur3(gray, width, height);
+  const magnitude = new Float32Array(total);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const o = y * width + x;
+      const tl = smooth[o - width - 1];
+      const t = smooth[o - width];
+      const tr = smooth[o - width + 1];
+      const l = smooth[o - 1];
+      const r = smooth[o + 1];
+      const bl = smooth[o + width - 1];
+      const b = smooth[o + width];
+      const br = smooth[o + width + 1];
+      const gx = tr + 2 * r + br - (tl + 2 * l + bl);
+      const gy = bl + 2 * b + br - (tl + 2 * t + tr);
+      magnitude[o] = Math.hypot(gx, gy);
+    }
+  }
+
+  const edge = new Uint8Array(total);
+  const markEdges = (threshold: number): number => {
+    let count = 0;
+    for (let p = 0; p < total; p++) {
+      if (magnitude[p] <= threshold) continue;
+      edge[p] = 1;
+      count += 1;
+    }
+    return count;
+  };
+  const edgeCount = markEdges(LINE_EDGE_THRESHOLD);
+  // 低对比度素材可能一个边缘都提不出来，退回低阈值重算，避免输出全白图纸。
+  if (edgeCount / total < LINE_EDGE_MIN_RATIO) {
+    edge.fill(0);
+    markEdges(LINE_EDGE_LOW_THRESHOLD);
+  }
+
+  // 描边加粗到足够宽，缩到成品小档格网仍能看见轮廓。
+  const result = new Uint8ClampedArray(total * 3).fill(255);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!edge[y * width + x]) continue;
+      for (let dy = -LINE_STROKE_RADIUS; dy <= LINE_STROKE_RADIUS; dy++) {
+        for (let dx = -LINE_STROKE_RADIUS; dx <= LINE_STROKE_RADIUS; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const o = (ny * width + nx) * 3;
+          result[o] = OUTLINE_RGB[0];
+          result[o + 1] = OUTLINE_RGB[1];
+          result[o + 2] = OUTLINE_RGB[2];
+        }
+      }
+    }
+  }
+
+  return sharp(Buffer.from(result.buffer), { raw: { width, height, channels: 3 } })
+    .png()
+    .toBuffer();
+}
+
 /** 在风格工作尺寸上执行各风格的像素处理，返回 PNG。 */
 async function renderStyleVariant(working: Buffer, style: GeneratedStyleId): Promise<Buffer> {
   switch (style) {
@@ -266,7 +413,7 @@ async function renderStyleVariant(working: Buffer, style: GeneratedStyleId): Pro
         .png()
         .toBuffer();
     case 'line':
-      return sharp(working).grayscale().threshold(160).png().toBuffer();
+      return renderLine(working);
     case 'flat':
       return sharp(working).median(5).sharpen().png().toBuffer();
     case 'chibi':
