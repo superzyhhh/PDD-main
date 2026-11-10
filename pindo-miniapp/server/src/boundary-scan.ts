@@ -21,10 +21,17 @@ const ENGINE_SIGNATURES = [
   'GNU GENERAL PUBLIC LICENSE',
 ];
 
+/**
+ * 云端函数调用特征：高级风格只能由服务端经云函数出口调用，小程序端不得直连。
+ * 只认调用函数的特征，不拦 `wx.cloud` 本身，避免误伤云存储等无关能力。
+ */
+const CLOUD_MODEL_SIGNATURES = ['cloud.callFunction', 'tcb.callFunction'];
+
 const FORBIDDEN_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts']);
 
 /**
- * ADR-0001 的 CI 检查：小程序产物不得包含任何来自云端的引擎源码或编译产物。
+ * ADR-0001 的 CI 检查：小程序产物不得包含任何来自云端的引擎源码或编译产物；
+ * 同时拦截小程序端直连云端模型的调用，高级风格只能走服务端云函数出口。
  */
 export async function scanMiniProgram(root: string): Promise<BoundaryFinding[]> {
   const findings: BoundaryFinding[] = [];
@@ -59,6 +66,9 @@ export async function scanMiniProgram(root: string): Promise<BoundaryFinding[]> 
       const text = await readFile(full, 'utf8').catch(() => '');
       for (const signature of ENGINE_SIGNATURES) {
         if (text.includes(signature)) findings.push({ file: full, reason: `出现引擎特征：${signature}` });
+      }
+      for (const signature of CLOUD_MODEL_SIGNATURES) {
+        if (text.includes(signature)) findings.push({ file: full, reason: `出现云端函数调用：${signature}` });
       }
       if (/require\s*\(\s*['"][^'"]*server[^'"]*['"]\s*\)|from\s+['"][^'"]*server[^'"]*['"]/.test(text)) {
         findings.push({ file: full, reason: '引用了服务端代码' });

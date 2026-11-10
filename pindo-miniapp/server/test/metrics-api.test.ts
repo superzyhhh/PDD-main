@@ -3,6 +3,7 @@ import type { Server } from 'node:http';
 import sharp from 'sharp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type ServerOptions } from '../src/server';
+import { listenOnRandomPort } from './support/listen';
 import type { Moderation } from '../src/moderation';
 import { MetricsStore } from '../src/metrics';
 import { createSandboxPaymentProvider } from '../src/payment';
@@ -37,7 +38,7 @@ async function startApp(options: Partial<ServerOptions> = {}): Promise<string> {
     isAdvancedStyleAllowed: () => true,
     ...options,
   });
-  await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
+  await listenOnRandomPort(server!);
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
 }

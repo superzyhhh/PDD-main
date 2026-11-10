@@ -1,8 +1,9 @@
 import { createWechatModeration, allowAllModeration } from './moderation';
 import { createSandboxPaymentProvider, unconfiguredPaymentProvider } from './payment';
+import { createCloudFunctionStyleProvider } from './cloud-function-style';
 import { createServer } from './server';
 import { createSessionService } from './session';
-import { createFakeStyleProvider } from './style';
+import { createFakeStyleProvider, type StyleProvider } from './style';
 
 const port = Number(process.env.PORT ?? 3000);
 const appId = process.env.WX_APP_ID;
@@ -42,14 +43,30 @@ const advancedOpenIds = (process.env.ADVANCED_PALETTE_OPENIDS ?? '')
 const isAdvancedPaletteAllowed = (openId?: string): boolean =>
   !!openId && advancedOpenIds.includes(openId);
 
-// 风格服务：真实厂商凭据到位前仅提供确定性假实现，生产环境禁止误用。
+// 风格服务：优先接云函数出口；没有配置时仅提供确定性假实现（本地联调），生产环境禁止误用。
 const styleSandbox = process.env.STYLE_SANDBOX === '1';
 if (styleSandbox && process.env.NODE_ENV === 'production') {
   throw new Error('生产环境禁止启用 STYLE_SANDBOX');
 }
-const styleProvider = styleSandbox ? createFakeStyleProvider() : undefined;
-if (!styleProvider) {
-  console.warn('[pindo-miniapp] 未配置风格服务，风格族入口关闭，原图生成不受影响');
+
+const styleEndpoint = process.env.STYLE_CLOUD_FUNCTION_URL;
+const styleModelVersion = process.env.STYLE_MODEL_VERSION;
+let styleProvider: StyleProvider | undefined;
+if (styleSandbox) {
+  styleProvider = createFakeStyleProvider();
+} else if (styleEndpoint && styleModelVersion) {
+  const styleTimeoutMs = Number(process.env.STYLE_TIMEOUT_MS ?? '');
+  styleProvider = createCloudFunctionStyleProvider({
+    endpoint: styleEndpoint,
+    token: process.env.STYLE_CLOUD_FUNCTION_TOKEN,
+    modelVersion: styleModelVersion,
+    ...(Number.isFinite(styleTimeoutMs) && styleTimeoutMs > 0 ? { timeoutMs: styleTimeoutMs } : {}),
+  });
+} else if (styleEndpoint) {
+  // 模型版本进入风格缓存键，缺省会让旧缓存无法失效；宁可关闭高级风格也不带病上线。
+  console.warn('[pindo-miniapp] STYLE_CLOUD_FUNCTION_URL 缺少 STYLE_MODEL_VERSION，高级风格入口关闭');
+} else {
+  console.warn('[pindo-miniapp] 未配置风格服务，高级风格入口关闭，免费风格与原图生成不受影响');
 }
 
 createServer({

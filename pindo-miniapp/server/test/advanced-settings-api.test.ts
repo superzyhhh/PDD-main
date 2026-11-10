@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import sharp from 'sharp';
 import { createServer, type ServerOptions } from '../src/server';
+import { listenOnRandomPort } from './support/listen';
 import type { Moderation } from '../src/moderation';
 
 const allowAll: Moderation = { check: async () => 'pass' };
@@ -18,7 +19,7 @@ afterEach(async () => {
 
 async function startApp(options: Partial<ServerOptions> = {}): Promise<string> {
   server = createServer({ moderation: allowAll, ...options });
-  await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
+  await listenOnRandomPort(server!);
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
 }

@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import sharp from 'sharp';
 import { createServer } from '../src/server';
+import { listenOnRandomPort } from './support/listen';
 import type { Moderation } from '../src/moderation';
 import type { PaymentProvider } from '../src/payment';
 import { createSandboxPaymentProvider } from '../src/payment';
@@ -30,7 +31,7 @@ async function startApp(options: { payment?: PaymentProvider; now?: () => Date }
     payment: options.payment,
     now: options.now ?? (() => new Date(clock)),
   });
-  await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
+  await listenOnRandomPort(server!);
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
 }
