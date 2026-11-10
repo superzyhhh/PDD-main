@@ -138,7 +138,7 @@ export const unconfiguredStyleProvider: StyleProvider = {
 };
 
 /** 本地算法版本；算法一改动就需要让旧缓存失效。 */
-export const LOCAL_STYLE_VERSION = 'local-v3';
+export const LOCAL_STYLE_VERSION = 'local-v4';
 
 /**
  * 风格工作尺寸：最大成品格网（87）的 4 倍，与成品尺寸档解耦，
@@ -194,8 +194,60 @@ function boxBlur3(input: Float32Array, width: number, height: number): Float32Ar
   return output;
 }
 
-/** 轮廓墨色，Q 版与线条风共用。 */
+/** 轮廓墨色，Q 版、平涂卡通与线条风共用。 */
 const OUTLINE_RGB = [40, 40, 40] as const;
+
+/** 相邻像素（RGB 三通道）的任一通道色差是否超过阈值。 */
+function rgbDiffExceeds(
+  pixels: Uint8ClampedArray,
+  a: number,
+  b: number,
+  threshold: number,
+): boolean {
+  return (
+    Math.abs(pixels[a] - pixels[b]) > threshold ||
+    Math.abs(pixels[a + 1] - pixels[b + 1]) > threshold ||
+    Math.abs(pixels[a + 2] - pixels[b + 2]) > threshold
+  );
+}
+
+/** 每通道按级别量化，输出 3 通道像素。 */
+function quantizeRgb(
+  data: ArrayLike<number>,
+  channels: number,
+  pixelCount: number,
+  levels: number,
+): Uint8ClampedArray {
+  const step = 255 / (levels - 1);
+  const output = new Uint8ClampedArray(pixelCount * 3);
+  for (let p = 0; p < pixelCount; p++) {
+    const i = p * channels;
+    for (let c = 0; c < 3; c++) output[p * 3 + c] = Math.round(data[i + c] / step) * step;
+  }
+  return output;
+}
+
+/** 以像素为中心画一块深色描边。 */
+function paintStroke(
+  canvas: Uint8ClampedArray,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  radius: number,
+): void {
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const o = (ny * width + nx) * 3;
+      canvas[o] = OUTLINE_RGB[0];
+      canvas[o + 1] = OUTLINE_RGB[1];
+      canvas[o + 2] = OUTLINE_RGB[2];
+    }
+  }
+}
 
 /** Q 版使用的色阶数量，压掉连续色阶让色块更整。 */
 const CHIBI_LEVELS = 5;
@@ -222,11 +274,7 @@ async function renderChibi(input: Buffer): Promise<Buffer> {
   }
 
   // 每通道 5 级量化：拼豆色号更少，色块边界更清晰。
-  const step = 255 / (CHIBI_LEVELS - 1);
-  const quantized = new Uint8ClampedArray(width * height * 3);
-  for (let i = 0; i < smooth.length; i++) {
-    quantized[i] = Math.round(smooth[i] / step) * step;
-  }
+  const quantized = quantizeRgb(smooth, 3, width * height, CHIBI_LEVELS);
 
   // 色块交界处画加粗深色轮廓，做「圆润简化」的勾边。
   const result = new Uint8ClampedArray(quantized);
@@ -243,16 +291,13 @@ async function renderChibi(input: Buffer): Promise<Buffer> {
       }
     }
   };
-  const differs = (a: number, b: number) =>
-    Math.abs(quantized[a] - quantized[b]) > CHIBI_EDGE_THRESHOLD ||
-    Math.abs(quantized[a + 1] - quantized[b + 1]) > CHIBI_EDGE_THRESHOLD ||
-    Math.abs(quantized[a + 2] - quantized[b + 2]) > CHIBI_EDGE_THRESHOLD;
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const o = (y * width + x) * 3;
       const edge =
-        (x + 1 < width && differs(o, o + 3)) || (y + 1 < height && differs(o, o + width * 3));
+        (x + 1 < width && rgbDiffExceeds(quantized, o, o + 3, CHIBI_EDGE_THRESHOLD)) ||
+        (y + 1 < height && rgbDiffExceeds(quantized, o, o + width * 3, CHIBI_EDGE_THRESHOLD));
       if (edge) paintOutline(x, y);
     }
   }
@@ -383,18 +428,7 @@ async function renderLine(input: Buffer): Promise<Buffer> {
   const result = new Uint8ClampedArray(total * 3).fill(255);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      if (!edge[y * width + x]) continue;
-      for (let dy = -LINE_STROKE_RADIUS; dy <= LINE_STROKE_RADIUS; dy++) {
-        for (let dx = -LINE_STROKE_RADIUS; dx <= LINE_STROKE_RADIUS; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const o = (ny * width + nx) * 3;
-          result[o] = OUTLINE_RGB[0];
-          result[o + 1] = OUTLINE_RGB[1];
-          result[o + 2] = OUTLINE_RGB[2];
-        }
-      }
+      if (edge[y * width + x]) paintStroke(result, width, height, x, y, LINE_STROKE_RADIUS);
     }
   }
 
@@ -403,19 +437,77 @@ async function renderLine(input: Buffer): Promise<Buffer> {
     .toBuffer();
 }
 
+/** 平涂卡通：中值去纹理 → 4 级量化成大色块 → 只在强边界加硬边轮廓。 */
+const FLAT_LEVELS = 4;
+/** 跨两级色阶（2×85）才勾边，比 Q 版逐级勾边稀疏得多。 */
+const FLAT_EDGE_THRESHOLD = 150;
+const FLAT_STROKE_RADIUS = 3;
+
+async function renderFlat(input: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(input)
+    .median(5)
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  const total = width * height;
+
+  // 每通道 4 级量化：合并相近色，得到大面积纯色块。
+  const quantized = quantizeRgb(data, channels, total, FLAT_LEVELS);
+
+  // 只勾跨两级以上的边界，避免像 Q 版那样每一级色阶都描边。
+  const result = new Uint8ClampedArray(quantized);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const o = (y * width + x) * 3;
+      const edge =
+        (x + 1 < width && rgbDiffExceeds(quantized, o, o + 3, FLAT_EDGE_THRESHOLD)) ||
+        (y + 1 < height && rgbDiffExceeds(quantized, o, o + width * 3, FLAT_EDGE_THRESHOLD));
+      if (edge) paintStroke(result, width, height, x, y, FLAT_STROKE_RADIUS);
+    }
+  }
+
+  return sharp(Buffer.from(result.buffer), { raw: { width, height, channels: 3 } })
+    .png()
+    .toBuffer();
+}
+
+/**
+ * 像素风：按块均值降采样 → 4 级量化 → 最近邻放大，缩到目标格网仍保留像素块。
+ * 块数取 29：与成品格网对齐（348 / 29 = 12），大档 87 格网里每块正好 3×3 格，
+ * 小档降采样后也不会把像素块抹平。
+ */
+const PIXEL_BLOCKS = 29;
+const PIXEL_LEVELS = 4;
+
+async function renderPixel(input: Buffer): Promise<Buffer> {
+  // 缩小时用插值把块内像素平均掉，而不是单点取样，避免原图噪点让整块跳色。
+  const { data, info } = await sharp(input)
+    .resize(PIXEL_BLOCKS, PIXEL_BLOCKS, { kernel: 'linear' })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { channels } = info;
+
+  const quantized = quantizeRgb(data, channels, PIXEL_BLOCKS * PIXEL_BLOCKS, PIXEL_LEVELS);
+
+  return sharp(Buffer.from(quantized.buffer), {
+    raw: { width: PIXEL_BLOCKS, height: PIXEL_BLOCKS, channels: 3 },
+  })
+    .resize(STYLE_WORKING_SIZE, STYLE_WORKING_SIZE, { kernel: 'nearest' })
+    .png()
+    .toBuffer();
+}
+
 /** 在风格工作尺寸上执行各风格的像素处理，返回 PNG。 */
 async function renderStyleVariant(working: Buffer, style: GeneratedStyleId): Promise<Buffer> {
   switch (style) {
     case 'pixel':
-      return sharp(working)
-        .resize({ width: 64, kernel: 'nearest' })
-        .resize(STYLE_WORKING_SIZE, STYLE_WORKING_SIZE, { kernel: 'nearest' })
-        .png()
-        .toBuffer();
+      return renderPixel(working);
     case 'line':
       return renderLine(working);
     case 'flat':
-      return sharp(working).median(5).sharpen().png().toBuffer();
+      return renderFlat(working);
     case 'chibi':
       return renderChibi(working);
     case 'anime':

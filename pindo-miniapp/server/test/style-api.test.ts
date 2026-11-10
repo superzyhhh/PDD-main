@@ -691,6 +691,176 @@ describe('风格转换流水线', () => {
   });
 });
 
+/** 白底径向渐变圆形（带轻微噪点）：模拟连续色调的照片，用来区分平涂、像素与 Q 版。 */
+async function gradientCirclePng(size = 96): Promise<Buffer> {
+  const raw = Buffer.alloc(size * size * 3, 255);
+  const center = (size - 1) / 2;
+  const radius = size * 0.4;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const distance = Math.hypot(x - center, y - center);
+      if (distance > radius) continue;
+      const t = distance / radius;
+      const noise = ((x * 37 + y * 91) % 37) - 18;
+      const i = (y * size + x) * 3;
+      raw[i] = Math.round(230 - 160 * t + noise);
+      raw[i + 1] = Math.round(70 + 120 * t + noise);
+      raw[i + 2] = Math.round(50 + 130 * t + noise);
+    }
+  }
+  return sharp(raw, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
+}
+
+/** 候选格网里深色格的占比：用来比较不同风格的硬边轮廓密度。 */
+function darkCellRatio(candidate: any): number {
+  const hex = new Map<string, string>(
+    (candidate.colors as Array<{ code: string; hex: string }>).map((color) => [
+      color.code,
+      color.hex,
+    ]),
+  );
+  const grid = candidate.grid as string[][];
+  let dark = 0;
+  for (const row of grid) {
+    for (const code of row) {
+      const value = hex.get(code) ?? '#ffffff';
+      const [r, g, b] = [1, 3, 5].map((offset) => parseInt(value.slice(offset, offset + 2), 16));
+      if ((r + g + b) / 3 < 120) dark += 1;
+    }
+  }
+  return dark / (grid.length * grid[0].length);
+}
+
+/** 把格网按 3×3 对齐分块，统计颜色完全一致的块占比：像素块在成品格网里可见且稳定。 */
+function alignedBlockRatio(candidate: any): number {
+  const grid = candidate.grid as string[][];
+  const block = 3;
+  let uniform = 0;
+  let total = 0;
+  for (let by = 0; by + block <= grid.length; by += block) {
+    for (let bx = 0; bx + block <= grid[0].length; bx += block) {
+      const code = grid[by][bx];
+      let same = true;
+      for (let y = by; y < by + block && same; y++) {
+        for (let x = bx; x < bx + block; x++) {
+          if (grid[y][x] !== code) {
+            same = false;
+            break;
+          }
+        }
+      }
+      total += 1;
+      if (same) uniform += 1;
+    }
+  }
+  return total === 0 ? 0 : uniform / total;
+}
+
+describe('平涂卡通', () => {
+  it('端到端三候选与既有不变量成立，主体结构保留', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const flat = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'flat' }));
+    const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+    expect(flat.candidates).toHaveLength(3);
+    flat.candidates.forEach((candidate: any) => {
+      expect(candidate.width).toBe(29);
+      expect(candidate.height).toBe(29);
+      expect(candidate.boardCount).toBe(1);
+      expect(candidate.paletteTier).toBe('basic');
+    });
+    // 主体结构保留：抠主体后仍是实心色块，面积不缩水、不碎裂。
+    const styled = gridStats(flat.candidates[0]);
+    const original = gridStats(plain.candidates[0]);
+    expect(styled.ratio).toBeGreaterThan(original.ratio * 0.9);
+    expect(styled.components).toBe(1);
+    expect(styled.bboxSpan).toBeGreaterThan(0.9);
+  });
+
+  it('与 Q 版可区分：硬边轮廓明显更少，已不是同一张图纸', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const flat = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'flat' }));
+    const chibi = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'chibi' }));
+
+    expect(flat.candidates[0].grid).not.toEqual(chibi.candidates[0].grid);
+    expect(darkCellRatio(flat.candidates[2])).toBeLessThan(darkCellRatio(chibi.candidates[2]));
+  });
+});
+
+describe('像素风', () => {
+  it('端到端三候选与既有不变量成立，轮廓可辨识', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const pixel = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'pixel' }));
+    const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+    expect(pixel.candidates).toHaveLength(3);
+    pixel.candidates.forEach((candidate: any) => {
+      expect(candidate.width).toBe(29);
+      expect(candidate.height).toBe(29);
+      expect(candidate.boardCount).toBe(1);
+      expect(candidate.paletteTier).toBe('basic');
+    });
+    // 少色号候选不做抖动，主体应连成一片；高细节候选的抖动会在边界留下零星噪点，不适合做连通性判据。
+    const stats = gridStats(pixel.candidates[2]);
+    const original = gridStats(plain.candidates[2]);
+    expect(stats.ratio).toBeGreaterThan(original.ratio * 0.9);
+    expect(stats.components).toBe(1);
+    expect(stats.bboxSpan).toBeGreaterThan(0.9);
+  });
+
+  it('大档格网里像素块整齐成块，没有被降采样抹平', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const large = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'pixel', sizeTier: 'large' }),
+    );
+
+    expect(large.candidates[0].width).toBe(87);
+    // 87 格网按 3×3 对齐分块，每块都对应一个 12px 像素块，颜色应当一致。
+    expect(alignedBlockRatio(large.candidates[2])).toBeGreaterThan(0.8);
+  });
+
+  it('缩到不同尺寸档后主体占比一致，没有失真', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const small = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'pixel', sizeTier: 'small' }),
+    );
+    const large = await waitForTask(
+      baseUrl,
+      await submit(baseUrl, image, { style: 'pixel', sizeTier: 'large' }),
+    );
+
+    expect(small.candidates[0].width).toBe(29);
+    expect(large.candidates[0].width).toBe(87);
+    const smallRatio = gridStats(small.candidates[2]).ratio;
+    const largeRatio = gridStats(large.candidates[2]).ratio;
+    expect(Math.abs(smallRatio - largeRatio)).toBeLessThan(0.1);
+  });
+
+  it('与其他风格互不复用，换风格产生不同图纸', async () => {
+    const baseUrl = await startApp();
+    const image = await gradientCirclePng();
+
+    const pixel = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'pixel' }));
+    const flat = await waitForTask(baseUrl, await submit(baseUrl, image, { style: 'flat' }));
+    const plain = await waitForTask(baseUrl, await submit(baseUrl, image));
+
+    expect(pixel.candidates[0].grid).not.toEqual(flat.candidates[0].grid);
+    expect(pixel.candidates[0].grid).not.toEqual(plain.candidates[0].grid);
+  });
+});
+
 describe('线条风', () => {
   it('照片走边缘提取：三候选、尺寸档与色卡档不变，轮廓覆盖主体且不碎', async () => {
     const baseUrl = await startApp();
