@@ -197,7 +197,7 @@ describe('高级风格经云函数出口', () => {
     expect(cloud.calls).toHaveLength(1);
   });
 
-  it('云函数限流时以风格化失败结束，不自动换风格，重试会再次调用', async () => {
+  it('云函数限流时以风格转换失败结束，不自动换风格，重试会再次调用', async () => {
     const { cloud, baseUrl } = await startWithCloud(() => ({
       status: 429,
       body: Buffer.from('{"error":"rate limited"}'),
@@ -218,7 +218,7 @@ describe('高级风格经云函数出口', () => {
     expect(cloud.calls).toHaveLength(2);
   });
 
-  it('云函数超时时以风格化失败结束', async () => {
+  it('云函数超时时以风格转换失败结束', async () => {
     const { baseUrl } = await startWithCloud(() => new Promise<CloudReply>(() => {}), {
       timeoutMs: 40,
     });

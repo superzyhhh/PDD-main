@@ -64,8 +64,11 @@ export interface StyleSummaryEntry {
   style: StyleId;
   generation: { tasks: number; users: number };
   firstAcceptance: { count: number; rate: number | null };
-  /** 风格化失败次数与失败率；分母为该风格的生成任务数加风格化失败数。 */
-  styleFailure: { count: number; rate: number | null };
+  /**
+   * 风格转换失败次数与失败率：免费风格的本地算法失败与高级风格的外部依赖失败都计入，
+   * 风格转换结果不符合内容规范不计入。分母为该风格的生成任务数加风格转换失败数。
+   */
+  styleConversionFailure: { count: number; rate: number | null };
 }
 
 export interface MetricsSummary {
@@ -106,7 +109,7 @@ interface UserEvent {
 export class MetricsStore {
   private readonly generations: TaskEvent[] = [];
   private readonly acceptances: TaskEvent[] = [];
-  private readonly styleFailures: TaskEvent[] = [];
+  private readonly styleConversionFailures: TaskEvent[] = [];
   private readonly quotaExhausted: UserEvent[] = [];
   private readonly activations: UserEvent[] = [];
   private readonly blindTests = new Map<string, BlindTestRecord>();
@@ -121,9 +124,9 @@ export class MetricsStore {
     this.recordOnce(this.acceptances, event);
   }
 
-  /** 风格化失败同一任务只计一次；成功生成与内容不合规都不计入失败口径。 */
-  recordStyleFailure(event: TaskEvent): void {
-    this.recordOnce(this.styleFailures, event);
+  /** 风格转换失败同一任务只计一次；成功生成与内容不合规都不计入失败口径。 */
+  recordStyleConversionFailure(event: TaskEvent): void {
+    this.recordOnce(this.styleConversionFailures, event);
   }
 
   recordQuotaExhausted(openId: string, at: number): void {
@@ -186,7 +189,7 @@ export class MetricsStore {
         .map((item) => item.taskId),
     );
     const acceptedCount = [...generationIds].filter((id) => acceptanceIds.has(id)).length;
-    const failures = this.styleFailures.filter(
+    const failures = this.styleConversionFailures.filter(
       (item) => inRange(item.at) && inChannel(item.channel),
     );
 
@@ -197,8 +200,8 @@ export class MetricsStore {
       const styleAccepted = [...styleTaskIds].filter((id) => acceptanceIds.has(id)).length;
       const styleUsers = new Set<string>();
       for (const item of styleGenerations) if (item.openId) styleUsers.add(item.openId);
-      const styleFailures = failures.filter((item) => item.style === style).length;
-      const attempts = styleGenerations.length + styleFailures;
+      const styleConversionFailures = failures.filter((item) => item.style === style).length;
+      const attempts = styleGenerations.length + styleConversionFailures;
       return {
         style,
         generation: { tasks: styleGenerations.length, users: styleUsers.size },
@@ -206,7 +209,10 @@ export class MetricsStore {
           count: styleAccepted,
           rate: styleGenerations.length === 0 ? null : styleAccepted / styleGenerations.length,
         },
-        styleFailure: { count: styleFailures, rate: attempts === 0 ? null : styleFailures / attempts },
+        styleConversionFailure: {
+          count: styleConversionFailures,
+          rate: attempts === 0 ? null : styleConversionFailures / attempts,
+        },
       };
     });
 

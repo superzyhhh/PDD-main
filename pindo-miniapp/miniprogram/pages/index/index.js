@@ -339,7 +339,7 @@ Page({
     else this.chooseImage();
   },
 
-  /** 风格化失败后一键跳过风格，按原图继续生成；复用已选图片，无需重新上传。 */
+  /** 风格转换失败后一键跳过风格，按原图继续生成；复用已选图片，无需重新上传。 */
   skipStyle() {
     this.setData({ style: 'original' });
     this.retry();

@@ -349,17 +349,17 @@ describe('埋点与验证看板', () => {
     expect(styleEntry(xhs, 'original')).toMatchObject({
       generation: { tasks: 1, users: 1 },
       firstAcceptance: { count: 0, rate: 0 },
-      styleFailure: { count: 0, rate: 0 },
+      styleConversionFailure: { count: 0, rate: 0 },
     });
     expect(styleEntry(xhs, 'anime')).toMatchObject({
       generation: { tasks: 1, users: 1 },
       firstAcceptance: { count: 1, rate: 1 },
-      styleFailure: { count: 0, rate: 0 },
+      styleConversionFailure: { count: 0, rate: 0 },
     });
     expect(styleEntry(xhs, 'chibi')).toMatchObject({
       generation: { tasks: 0, users: 0 },
       firstAcceptance: { count: 0, rate: null },
-      styleFailure: { count: 0, rate: null },
+      styleConversionFailure: { count: 0, rate: null },
     });
 
     const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
@@ -374,7 +374,7 @@ describe('埋点与验证看板', () => {
     expect(styleEntry(combined, 'anime')).toMatchObject({
       generation: { tasks: 1, users: 1 },
       firstAcceptance: { count: 1, rate: 1 },
-      styleFailure: { count: 0, rate: 0 },
+      styleConversionFailure: { count: 0, rate: 0 },
     });
     expect(styleEntry(combined, 'chibi')).toMatchObject({ generation: { tasks: 0, users: 0 } });
 
@@ -385,11 +385,11 @@ describe('埋点与验证看板', () => {
     for (const entry of future.byStyle) {
       expect(entry.generation.tasks).toBe(0);
       expect(entry.firstAcceptance.rate).toBeNull();
-      expect(entry.styleFailure.rate).toBeNull();
+      expect(entry.styleConversionFailure.rate).toBeNull();
     }
   });
 
-  it('看板按风格统计风格化失败次数与失败率，同一任务只计一次', async () => {
+  it('看板按风格统计风格转换失败次数与失败率，同一任务只计一次', async () => {
     const base = createFakeStyleProvider();
     const flaky: StyleProvider = {
       available: true,
@@ -411,31 +411,78 @@ describe('埋点与验证看板', () => {
     const xhs = await summary(baseUrl, adminToken, { channel: 'xiaohongshu' });
     expect(styleEntry(xhs, 'anime')).toMatchObject({
       generation: { tasks: 1, users: 1 },
-      styleFailure: { count: 0, rate: 0 },
+      styleConversionFailure: { count: 0, rate: 0 },
     });
     expect(styleEntry(xhs, 'realistic')).toMatchObject({
       generation: { tasks: 0, users: 0 },
-      styleFailure: { count: 1, rate: 1 },
+      styleConversionFailure: { count: 1, rate: 1 },
     });
 
     const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
-    expect(styleEntry(douyin, 'realistic')).toMatchObject({ styleFailure: { count: 0, rate: null } });
+    expect(styleEntry(douyin, 'realistic')).toMatchObject({ styleConversionFailure: { count: 0, rate: null } });
 
     // 时间与渠道同时生效时仍按风格统计失败。
     const combined = await summary(baseUrl, adminToken, {
       channel: 'xiaohongshu',
       from: new Date(clock - 60_000),
     });
-    expect(styleEntry(combined, 'realistic')).toMatchObject({ styleFailure: { count: 1, rate: 1 } });
+    expect(styleEntry(combined, 'realistic')).toMatchObject({ styleConversionFailure: { count: 1, rate: 1 } });
 
     // 同一任务重复上报只计一次。
     const store = new MetricsStore();
-    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
-    store.recordStyleFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
-    expect(styleEntry(store.summary(), 'realistic')!.styleFailure.count).toBe(1);
+    store.recordStyleConversionFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
+    store.recordStyleConversionFailure({ taskId: 'style-task', channel: 'direct', style: 'realistic', at: clock });
+    expect(styleEntry(store.summary(), 'realistic')!.styleConversionFailure.count).toBe(1);
   });
 
-  it('风格化内容不合规按独立失败原因结束，不混入风格化失败次数', async () => {
+  it('免费风格的本地算法失败同样计入风格转换失败，渠道与时间过滤不串台', async () => {
+    const working = createFakeStyleProvider();
+    let calls = 0;
+    const brokenLocal: StyleProvider = {
+      available: true,
+      version: 'broken-local-v1',
+      async stylize(input) {
+        calls += 1;
+        // 只让第一次调用失败，第二次同风格在另一渠道正常出图，作为过滤对照。
+        if (calls === 1) throw new Error('local algorithm crashed');
+        return working.stylize(input);
+      },
+    };
+    const adminToken = 'metrics-admin';
+    const baseUrl = await startApp({ adminToken, freeStyle: brokenLocal });
+    const token = await login(baseUrl, 'free-style-failure');
+
+    const failed = await generate(baseUrl, token, 'douyin', 0, 'flat');
+    expect(failed.status).toBe('failed');
+    expect(failed.failure.code).toBe('style-failed');
+    // 同风格在另一渠道正常出图，作为渠道过滤的对照。
+    const other = await generate(baseUrl, token, 'xiaohongshu', 1, 'flat');
+    expect(other.status).toBe('completed');
+
+    const douyin = await summary(baseUrl, adminToken, { channel: 'douyin' });
+    expect(styleEntry(douyin, 'flat')).toMatchObject({
+      generation: { tasks: 0, users: 0 },
+      styleConversionFailure: { count: 1, rate: 1 },
+    });
+
+    const xhs = await summary(baseUrl, adminToken, { channel: 'xiaohongshu' });
+    expect(styleEntry(xhs, 'flat')).toMatchObject({
+      generation: { tasks: 1, users: 1 },
+      styleConversionFailure: { count: 0, rate: 0 },
+    });
+
+    // 失败时间落在窗口外时不计入。
+    const past = await summary(baseUrl, adminToken, {
+      channel: 'douyin',
+      to: new Date(clock - 1000),
+    });
+    expect(styleEntry(past, 'flat')).toMatchObject({
+      generation: { tasks: 0, users: 0 },
+      styleConversionFailure: { count: 0, rate: null },
+    });
+  });
+
+  it('风格转换结果不合规按独立失败原因结束，不混入风格转换失败次数', async () => {
     // 只在风格图（PNG）复核时拦截，原图上传仍放行。
     const blockStyledOutput: Moderation = {
       check: async ({ contentType }) => (contentType === 'image/png' ? 'block' : 'pass'),
@@ -457,7 +504,7 @@ describe('埋点与验证看板', () => {
     expect(styleEntry(view, 'original')).toMatchObject({ generation: { tasks: 1, users: 1 } });
     expect(styleEntry(view, 'anime')).toMatchObject({
       generation: { tasks: 0, users: 0 },
-      styleFailure: { count: 0, rate: null },
+      styleConversionFailure: { count: 0, rate: null },
     });
   });
 

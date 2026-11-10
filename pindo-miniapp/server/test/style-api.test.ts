@@ -397,7 +397,7 @@ describe('风格缓存与失败降级', () => {
     expect(calls).toBe(1);
   });
 
-  it('风格化失败不写入缓存，重试会再次调用风格服务', async () => {
+  it('风格转换失败不写入缓存，重试会再次调用风格服务', async () => {
     let attempts = 0;
     const inner = createFakeStyleProvider();
     const provider: StyleProvider = {
@@ -448,7 +448,7 @@ describe('风格缓存与失败降级', () => {
     expect(calls.map((call) => call.style)).toEqual(['anime', 'realistic']);
   });
 
-  it('风格服务超时后任务以风格化失败结束且不产出候选', async () => {
+  it('风格服务超时后任务以风格转换失败结束且不产出候选', async () => {
     const { provider, calls } = recordingProvider(
       createFakeStyleProvider({ behavior: 'timeout', timeoutMs: 40 }),
     );
@@ -462,7 +462,7 @@ describe('风格缓存与失败降级', () => {
     expect(calls).toHaveLength(1);
   });
 
-  it('风格服务非成功响应时任务以风格化失败结束', async () => {
+  it('风格服务非成功响应时任务以风格转换失败结束', async () => {
     const baseUrl = await startApp({
       style: createFakeStyleProvider({ behavior: 'error' }),
     });
@@ -474,7 +474,7 @@ describe('风格缓存与失败降级', () => {
     expect(task.failure.code).toBe('style-failed');
   });
 
-  it('风格服务返回不可解码图片时任务以风格化失败结束', async () => {
+  it('风格服务返回不可解码图片时任务以风格转换失败结束', async () => {
     const baseUrl = await startApp({
       style: createFakeStyleProvider({ behavior: 'bad-image' }),
     });
@@ -486,7 +486,7 @@ describe('风格缓存与失败降级', () => {
     expect(task.failure.code).toBe('style-failed');
   });
 
-  it('风格化失败后可按原图继续生成，不重复调用风格服务', async () => {
+  it('风格转换失败后可按原图继续生成，不重复调用风格服务', async () => {
     const { provider, calls } = recordingProvider(
       createFakeStyleProvider({ behavior: 'error' }),
     );

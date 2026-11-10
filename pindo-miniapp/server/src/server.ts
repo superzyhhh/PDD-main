@@ -81,6 +81,8 @@ export interface ServerOptions {
   payment?: PaymentProvider;
   /** 风格服务；缺省为未配置，高级风格关闭，免费风格仍由本地算法完成。 */
   style?: StyleProvider;
+  /** 免费风格的本地转换器；仅在测试或本地演示时替换，生产始终用本地算法。 */
+  freeStyle?: StyleProvider;
   /** 高级风格白名单（内测期）；未提供时只按生成式服务是否已配置判定。 */
   isAdvancedStyleAllowed?: (openId?: string) => boolean;
   /** 测试注入时钟；缺省用系统时间。 */
@@ -170,8 +172,8 @@ export function createServer(options: ServerOptions): Server {
   const now = options.now ?? (() => new Date());
   const payment = options.payment ?? unconfiguredPaymentProvider;
   const styleProvider = options.style ?? unconfiguredStyleProvider;
-  /** 免费风格不依赖外部服务，任何配置下都可用。 */
-  const freeStyleProvider = createLocalStyleProvider();
+  /** 缺省用本地算法，免费风格任何配置下都可用；注入仅用于测试或本地演示。 */
+  const freeStyleProvider = options.freeStyle ?? createLocalStyleProvider();
   const styleCache = new StyleCache();
   /** 同一张原图同一种风格的并发请求合并成一次调用，避免重复计费。 */
   const pendingStyles = new Map<string, Promise<StylizedImage>>();
@@ -217,21 +219,21 @@ export function createServer(options: ServerOptions): Server {
     return result;
   }
 
-  /** 风格化失败统一留痕，并以可识别原因结束任务。 */
-  function failStyle(taskId: string, style: StyleId, stage: string, error: unknown): void {
+  /** 风格转换失败统一留痕，并以可识别原因结束任务。 */
+  function failStyleConversion(taskId: string, style: StyleId, stage: string, error: unknown): void {
     logger.warn('style_failed', {
       taskId,
       style,
       stage,
       error: error instanceof Error ? error.message : String(error),
     });
-    recordStyleFailure(taskId, style);
-    store.fail(taskId, 'style-failed', '风格化失败，请重试');
+    recordStyleConversionFailure(taskId, style);
+    store.fail(taskId, 'style-failed', '风格转换失败，请重试');
   }
 
-  /** 风格化失败看板事件：同一任务只计一次，成功生成不污染失败口径。 */
-  function recordStyleFailure(taskId: string, style: StyleId): void {
-    metrics.recordStyleFailure({
+  /** 风格转换失败看板事件：免费与高级风格共用，同一任务只计一次。 */
+  function recordStyleConversionFailure(taskId: string, style: StyleId): void {
+    metrics.recordStyleConversionFailure({
       taskId,
       openId: store.ownerOf(taskId),
       channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
@@ -314,7 +316,7 @@ export function createServer(options: ServerOptions): Server {
               generative,
             );
           } catch (error) {
-            failStyle(taskId, style, 'provider', error);
+            failStyleConversion(taskId, style, 'provider', error);
             return;
           }
 
@@ -341,7 +343,7 @@ export function createServer(options: ServerOptions): Server {
               stage: 'style-output',
               at: new Date().toISOString(),
             });
-            store.fail(taskId, 'style-blocked', '风格化结果不符合内容规范，请换一张图');
+            store.fail(taskId, 'style-blocked', '风格转换结果不符合内容规范，请换一张图');
             return;
           }
         }
@@ -349,7 +351,7 @@ export function createServer(options: ServerOptions): Server {
         try {
           decoded = await decodeImage(styled.buffer);
         } catch (error) {
-          failStyle(taskId, style, 'decode', error);
+          failStyleConversion(taskId, style, 'decode', error);
           return;
         }
         if (!cached) styleCache.set(cacheKey, styled);
