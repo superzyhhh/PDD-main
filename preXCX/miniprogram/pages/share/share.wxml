@@ -1,0 +1,28 @@
+<view class="share-page">
+  <view wx:if="{{stage === 'loading'}}" class="state">
+    <text class="state-title">正在打开图纸</text>
+  </view>
+
+  <view wx:elif="{{stage === 'error'}}" class="state">
+    <text class="state-title">{{message || '分享已失效'}}</text>
+    <text class="state-hint">可以让分享者重新发一次</text>
+    <button class="btn primary" bindtap="goCreate">自己拼一张</button>
+  </view>
+
+  <block wx:else>
+    <view class="share-head">
+      <text class="share-title">{{title}}</text>
+      <text class="share-sub">{{boardCount}} 块拼板 · MARD 221</text>
+    </view>
+
+    <image
+      class="share-image"
+      src="{{coverUrl}}"
+      mode="widthFix"
+      show-menu-by-longpress
+    ></image>
+
+    <text class="share-hint">长按图纸可保存或转发；打开小程序还能自己拼一张</text>
+    <button class="btn primary" bindtap="goCreate">我也要拼一张</button>
+  </block>
+</view>

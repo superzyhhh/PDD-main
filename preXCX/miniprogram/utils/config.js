@@ -1,0 +1,9 @@
+// 开发期指向本机服务端（10.15.0.79 是本机局域网地址，真机调试需手机与电脑同一网络）。
+// 微信开发者工具需勾选「不校验合法域名、web-view、TLS 版本以及 HTTPS 证书」。
+// 上线时替换为微信云托管的外网 HTTPS 地址，并在小程序后台配置合法域名。
+module.exports = {
+  BASE_URL: 'http://10.15.0.79:3000',
+  POLL_INTERVAL_MS: 800,
+  POLL_TIMEOUT_MS: 30000,
+  MAX_IMAGE_BYTES: 10 * 1024 * 1024,
+};

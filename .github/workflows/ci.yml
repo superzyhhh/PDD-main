@@ -7,15 +7,20 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pindo-miniapp 是含 AI 风格与会员的完整版参照，preXCX 是当前上线的免费版主线。
+        project: [pindo-miniapp, preXCX]
     defaults:
       run:
-        working-directory: pindo-miniapp
+        working-directory: ${{ matrix.project }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: pindo-miniapp/package-lock.json
+          cache-dependency-path: ${{ matrix.project }}/package-lock.json
       - run: npm ci
       - run: npm run ci

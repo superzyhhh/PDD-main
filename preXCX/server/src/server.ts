@@ -1,0 +1,1228 @@
+import { createHash } from 'node:crypto';
+import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { parseAnalyticsEvent } from './analytics';
+import {
+  DEFAULT_ADVANCED_SETTINGS,
+  filterPaletteBySeries,
+  parseAdvancedSettings,
+  settingsFingerprint,
+  type AdvancedSettings,
+} from './advanced-settings';
+import { FailureSampleStore, MAX_FAILURE_SAMPLES } from './failure-samples';
+import {
+  ImageDecodeError,
+  decodeImage,
+  generateCandidates,
+  prepareSubject,
+} from './generation';
+import {
+  ExportStore,
+  UNLIMITED_EXPORT_QUOTA,
+  exportKey,
+  renderHdExport,
+  renderShareCover,
+  type ExportFormat,
+  type ExportRecord,
+} from './exports';
+import { consoleLogger, type Logger } from './logger';
+import {
+  BLIND_TEST_WINNERS,
+  DEFAULT_CHANNEL,
+  MetricsStore,
+  inTimeRange,
+  sanitizeChannel,
+  type BlindTestWinner,
+} from './metrics';
+import type { Moderation } from './moderation';
+import { getBasicPalette } from './palette';
+import { MAX_PATTERNS, PatternStore, patternSummary } from './patterns';
+import { renderTiledPrintExport } from './print';
+import { createSessionService, type SessionService } from './session';
+import { MAX_SHARES, SHARE_SOURCES, ShareStore, type ShareRecord, type ShareSource } from './shares';
+import {
+  DEFAULT_STYLE,
+  STYLE_LABELS,
+  StyleCache,
+  createLocalStyleProvider,
+  encodeStyleInput,
+  isStyleId,
+  styleCacheKey,
+  type StyleId,
+  type StyleInput,
+  type StyleProvider,
+  type StylizedImage,
+} from './style';
+import { TaskStore, type TaskMeta } from './store';
+import {
+  SIZE_TIERS,
+  type Candidate,
+  type SavedPattern,
+  type SizeTier,
+  type TaskFailureCode,
+} from './types';
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+export interface ServerOptions {
+  /** 必填：内容安全校验不能有默认放行路径。 */
+  moderation: Moderation;
+  logger?: Logger;
+  session?: SessionService;
+  /** 免费风格的本地转换器；仅在测试或本地演示时替换，生产始终用本地算法。 */
+  freeStyle?: StyleProvider;
+  /** 测试注入时钟；缺省用系统时间。 */
+  now?: () => Date;
+  /** 失败样本后台口令；未配置时后台查询接口不开放。 */
+  adminToken?: string;
+}
+
+class BodyTooLargeError extends Error {}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    'cache-control': 'no-store',
+  });
+  res.end(payload);
+}
+
+function sendError(res: ServerResponse, status: number, code: string, message: string): void {
+  sendJson(res, status, { error: { code, message } });
+}
+
+function readBody(req: IncomingMessage, limit = MAX_UPLOAD_BYTES): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new BodyTooLargeError());
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function contentKey(buffer: Buffer, meta: TaskMeta): string {
+  return createHash('sha256')
+    .update(buffer)
+    .update(
+      `|${meta.sizeTier}|${settingsFingerprint(meta.settings)}|${meta.style}`,
+    )
+    .digest('hex');
+}
+
+function failureFor(error: unknown): { code: TaskFailureCode; message: string } {
+  if (error instanceof ImageDecodeError && error.reason === 'too-large') {
+    return { code: 'image-too-large', message: '图片太大，请换一张尺寸小一些的图片' };
+  }
+  if (error instanceof ImageDecodeError) {
+    return { code: 'image-unsupported', message: '这张图片无法识别，请换一张 JPG 或 PNG 图片' };
+  }
+  return { code: 'internal', message: '生成失败，请稍后重试' };
+}
+
+/** 看板时间参数：缺省表示不限，格式非法由调用方回 400。 */
+function parseTimeBound(raw: string | null): { ok: true; value?: number } | { ok: false } {
+  if (raw === null || raw === '') return { ok: true };
+  const value = Date.parse(raw);
+  return Number.isNaN(value) ? { ok: false } : { ok: true, value };
+}
+
+/** 含逗号、引号或换行的字段按 RFC 4180 加引号转义。 */
+function csvEscape(value: string): string {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+export function createServer(options: ServerOptions): Server {
+  const moderation = options.moderation;
+  const logger = options.logger ?? consoleLogger;
+  const session = options.session ?? createSessionService();
+  const store = new TaskStore();
+  const exportStore = new ExportStore();
+  const patterns = new PatternStore();
+  const failureSamples = new FailureSampleStore();
+  const shares = new ShareStore();
+  const metrics = new MetricsStore();
+  const now = options.now ?? (() => new Date());
+  /** 免费版风格全部由本地算法完成；注入仅用于测试或本地演示。 */
+  const styleProvider = options.freeStyle ?? createLocalStyleProvider();
+  const styleCache = new StyleCache();
+  /** 同一张原图同一种风格的并发请求合并成一次调用。 */
+  const pendingStyles = new Map<string, Promise<StylizedImage>>();
+  /** 同一账号同一图纸的并发导出只渲染一次。 */
+  const pendingExports = new Map<string, Promise<ExportRecord>>();
+  const basicPalette = getBasicPalette();
+
+  /** 只复用同一请求上下文的任务：匿名归匿名，登录账号各自独立，保证生成即入我的图纸。 */
+  function reusableTaskFor(key: string, openId?: string) {
+    const reusable = store.findReusable(key);
+    if (!reusable || store.ownerOf(reusable.id) !== openId) return undefined;
+    return reusable;
+  }
+
+  /** 把图纸快照存入「我的图纸」，并把淘汰数量挂回任务，供客户端提示。 */
+  function savePattern(openId: string, taskId: string, candidate: Candidate): SavedPattern {
+    const saved = patterns.save(openId, taskId, candidate);
+    const result: SavedPattern = { id: saved.pattern.id, evictedCount: saved.evictedCount };
+    store.setSavedPattern(taskId, result);
+    if (saved.evictedCount > 0) {
+      logger.audit('pattern_evicted', {
+        openId,
+        taskId,
+        evictedCount: saved.evictedCount,
+        limit: MAX_PATTERNS,
+        at: new Date().toISOString(),
+      });
+    }
+    return result;
+  }
+
+  /** 风格转换失败统一留痕，并以可识别原因结束任务。 */
+  function failStyleConversion(taskId: string, style: StyleId, stage: string, error: unknown): void {
+    logger.warn('style_failed', {
+      taskId,
+      style,
+      stage,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    recordStyleConversionFailure(taskId, style);
+    store.fail(taskId, 'style-failed', '风格转换失败，请重试');
+  }
+
+  /** 风格转换失败看板事件：同一任务只计一次。 */
+  function recordStyleConversionFailure(taskId: string, style: StyleId): void {
+    metrics.recordStyleConversionFailure({
+      taskId,
+      openId: store.ownerOf(taskId),
+      channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
+      style,
+      at: now().getTime(),
+    });
+  }
+
+  function stylizeOnce(cacheKey: string, input: StyleInput): Promise<StylizedImage> {
+    const pending = pendingStyles.get(cacheKey);
+    if (pending) return pending;
+    const request = styleProvider.stylize(input).finally(() => pendingStyles.delete(cacheKey));
+    pendingStyles.set(cacheKey, request);
+    return request;
+  }
+
+  async function runTask(taskId: string, image: Buffer, meta: TaskMeta): Promise<void> {
+    const { sizeTier, settings, style } = meta;
+    store.markProcessing(taskId);
+    try {
+      const source = await decodeImage(image);
+      // 先抠主体：风格转换与出图共用同一份主体图，避免重复裁剪导致结果不一致。
+      let decoded = prepareSubject(source, settings.background);
+      if (style !== 'original') {
+        // 风格缓存以原图内容 + 风格 + 算法版本 + 背景模式为键：
+        // 仅改尺寸/色卡/高级设置时直接复用。
+        const cacheKey = styleCacheKey(image, style, styleProvider.version, settings.background);
+        const cached = styleCache.get(cacheKey);
+        let styled: StylizedImage;
+        if (cached) {
+          // 缓存命中的风格图在首次生成时已通过内容安全，无需重复校验。
+          styled = cached;
+        } else {
+          // 风格转换在抠主体之后，按固定工作尺寸执行。
+          try {
+            styled = await stylizeOnce(cacheKey, {
+              buffer: await encodeStyleInput(decoded),
+              contentType: 'image/png',
+              style,
+            });
+          } catch (error) {
+            failStyleConversion(taskId, style, 'provider', error);
+            return;
+          }
+
+          // 风格图输出同样要过内容安全，命中即结束任务，不进入出图。
+          let verdict: 'pass' | 'block' = 'pass';
+          try {
+            verdict = await moderation.check({
+              buffer: styled.buffer,
+              contentType: styled.contentType,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.warn('moderation_error', { taskId, stage: 'style-output', error: message });
+            logger.audit('moderation_skipped', {
+              taskId,
+              stage: 'style-output',
+              reason: message,
+              at: new Date().toISOString(),
+            });
+          }
+          if (verdict === 'block') {
+            logger.audit('content_blocked', {
+              taskId,
+              stage: 'style-output',
+              at: new Date().toISOString(),
+            });
+            store.fail(taskId, 'style-blocked', '风格转换结果不符合内容规范，请换一张图');
+            return;
+          }
+        }
+
+        try {
+          decoded = await decodeImage(styled.buffer);
+        } catch (error) {
+          failStyleConversion(taskId, style, 'decode', error);
+          return;
+        }
+        if (!cached) styleCache.set(cacheKey, styled);
+      }
+
+      const palette = filterPaletteBySeries(basicPalette, settings.series);
+      const candidates = generateCandidates(decoded, palette, { sizeTier, settings });
+      store.complete(taskId, candidates);
+      // 未登录任务不落库；登录用户在生成完成时自动保存默认候选。
+      const owner = store.ownerOf(taskId);
+      metrics.recordGeneration({
+        taskId,
+        openId: owner,
+        channel: store.channelOf(taskId) ?? DEFAULT_CHANNEL,
+        style: meta.style,
+        at: now().getTime(),
+      });
+      if (owner) savePattern(owner, taskId, candidates[0]);
+    } catch (error) {
+      const failure = failureFor(error);
+      if (failure.code === 'internal') {
+        logger.warn('generate_failed', { taskId, error: error instanceof Error ? error.message : String(error) });
+      }
+      store.fail(taskId, failure.code, failure.message);
+    }
+  }
+
+  async function handleSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let code: unknown;
+    try {
+      const body = await readBody(req, 4096);
+      code = (JSON.parse(body.toString('utf8') || '{}') as { code?: unknown }).code;
+    } catch {
+      sendError(res, 400, 'invalid-code', '登录信息不完整，请重试');
+      return;
+    }
+    if (typeof code !== 'string' || code.length === 0) {
+      sendError(res, 400, 'invalid-code', '登录信息不完整，请重试');
+      return;
+    }
+    try {
+      const token = await session.login(code);
+      sendJson(res, 200, { token });
+    } catch (error) {
+      logger.warn('session_failed', { error: error instanceof Error ? error.message : String(error) });
+      sendError(res, 502, 'session-failed', '登录失败，请重试');
+    }
+  }
+
+  async function handleEvent(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let raw: Buffer;
+    try {
+      raw = await readBody(req, 4096);
+    } catch {
+      sendError(res, 400, 'invalid-event', '埋点事件格式不正确');
+      return;
+    }
+    let event: ReturnType<typeof parseAnalyticsEvent>;
+    try {
+      event = parseAnalyticsEvent(JSON.parse(raw.toString('utf8') || 'null'));
+    } catch {
+      event = undefined;
+    }
+    if (!event) {
+      sendError(res, 400, 'invalid-event', '埋点事件格式不正确');
+      return;
+    }
+
+    // 事件必须对应已完成任务里真实存在的那张候选，避免伪造「首图接受」。
+    const view = store.toView(event.taskId);
+    const candidate = view?.status === 'completed' ? view.candidates?.[event.index] : undefined;
+    if (!candidate || candidate.id !== event.candidateId) {
+      sendError(res, 400, 'invalid-event', '埋点事件与任务结果不匹配');
+      return;
+    }
+    const owner = store.ownerOf(event.taskId);
+    if (owner) {
+      const token = String(req.headers['x-session-token'] ?? '');
+      if ((token ? session.openIdFor(token) : undefined) !== owner) {
+        sendError(res, 403, 'event-forbidden', '无权上报该任务的事件');
+        return;
+      }
+    }
+
+    logger.audit(event.name, {
+      taskId: event.taskId,
+      candidateId: event.candidateId,
+      index: event.index,
+      at: new Date().toISOString(),
+    });
+    if (event.name === 'first_pattern_accepted') {
+      metrics.recordAcceptance({
+        taskId: event.taskId,
+        openId: owner,
+        channel: store.channelOf(event.taskId) ?? DEFAULT_CHANNEL,
+        style: store.taskMeta(event.taskId)?.style ?? DEFAULT_STYLE,
+        at: now().getTime(),
+      });
+    }
+    sendJson(res, 200, { ok: true });
+  }
+
+  function requestOpenId(req: IncomingMessage): string | undefined {
+    const token = String(req.headers['x-session-token'] ?? '');
+    return token ? session.openIdFor(token) : undefined;
+  }
+
+  async function handleGenerate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const sizeTier = String(req.headers['x-size-tier'] ?? 'small') as SizeTier;
+    if (!SIZE_TIERS.includes(sizeTier)) {
+      sendError(res, 400, 'unsupported-option', '当前版本暂不支持该尺寸');
+      return;
+    }
+
+    const rawStyle = req.headers['x-style'];
+    const styleHeader = Array.isArray(rawStyle) ? rawStyle[0] : rawStyle;
+    // 缺省按原图处理；非法取值直接拒绝。
+    const style = styleHeader === undefined || styleHeader === '' ? DEFAULT_STYLE : styleHeader;
+    if (!isStyleId(style)) {
+      sendError(res, 400, 'invalid-style', '不支持该风格，请重新选择');
+      return;
+    }
+
+    // 渠道由投放链接带入，非法值统一归为直接访问。
+    const rawChannel = req.headers['x-channel'];
+    const channel = sanitizeChannel(Array.isArray(rawChannel) ? rawChannel[0] : rawChannel);
+    const openId = requestOpenId(req);
+
+    const rawSettingsHeader = req.headers['x-advanced-settings'];
+    const rawSettings = Array.isArray(rawSettingsHeader) ? rawSettingsHeader[0] : rawSettingsHeader;
+    const parsedSettings = parseAdvancedSettings(rawSettings);
+    if (parsedSettings === null) {
+      sendError(res, 400, 'invalid-settings', '高级设置不可用，请重置后再试');
+      return;
+    }
+    const settings = parsedSettings ?? DEFAULT_ADVANCED_SETTINGS;
+    if (filterPaletteBySeries(basicPalette, settings.series).length === 0) {
+      sendError(res, 400, 'invalid-settings', '当前系列过滤后没有可用色号，请放宽设置');
+      return;
+    }
+
+    let image: Buffer;
+    try {
+      image = await readBody(req);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        sendError(res, 413, 'image-too-large', '图片太大，请换一张小于 10MB 的图片');
+        return;
+      }
+      throw error;
+    }
+    if (image.length === 0) {
+      sendError(res, 400, 'empty-image', '没有收到图片，请重新上传');
+      return;
+    }
+
+    const meta: TaskMeta = { sizeTier, settings, style };
+    const key = contentKey(image, meta);
+    const reusable = reusableTaskFor(key, openId);
+    if (reusable) {
+      sendJson(res, 202, { taskId: reusable.id, status: reusable.status });
+      return;
+    }
+
+    const contentType = String(req.headers['content-type'] ?? 'application/octet-stream');
+    let verdict: 'pass' | 'block' = 'pass';
+    try {
+      verdict = await moderation.check({ buffer: image, contentType });
+    } catch (error) {
+      // 内容安全接口异常时放行，但留痕，避免把可用性押在外部接口上。
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn('moderation_error', { error: message });
+      logger.audit('moderation_skipped', { contentKey: key, reason: message, at: new Date().toISOString() });
+    }
+
+    if (verdict === 'block') {
+      logger.audit('content_blocked', {
+        contentKey: key,
+        bytes: image.length,
+        at: new Date().toISOString(),
+      });
+      sendError(res, 422, 'content-unsafe', '这张图片不符合内容规范，请换一张图');
+      return;
+    }
+
+    // 内容安全校验是异步的，并发提交可能在此期间已经建出任务；这里再查一次，
+    // 保证同一内容的并发请求只落一个任务。
+    const concurrent = reusableTaskFor(key, openId);
+    if (concurrent) {
+      sendJson(res, 202, { taskId: concurrent.id, status: concurrent.status });
+      return;
+    }
+
+    const task = store.create(key, openId, meta, channel);
+    sendJson(res, 202, { taskId: task.id, status: task.status });
+    setImmediate(() => void runTask(task.id, image, meta));
+  }
+
+  /** 取当前登录账号；未登录时回 401 并返回 undefined。 */
+  function requireOpenId(req: IncomingMessage, res: ServerResponse, message: string): string | undefined {
+    const openId = requestOpenId(req);
+    if (!openId) sendError(res, 401, 'login-required', message);
+    return openId;
+  }
+
+  /** 「我的图纸」列表只返回摘要，逐格色号在打开时再取。 */
+  function handleListPatterns(req: IncomingMessage, res: ServerResponse): void {
+    const openId = requireOpenId(req, res, '请先登录再查看「我的图纸」');
+    if (!openId) return;
+    sendJson(res, 200, { limit: MAX_PATTERNS, patterns: patterns.list(openId).map(patternSummary) });
+  }
+
+  function handleGetPattern(req: IncomingMessage, res: ServerResponse, patternId: string): void {
+    const openId = requireOpenId(req, res, '请先登录再查看「我的图纸」');
+    if (!openId) return;
+    const record = patterns.get(openId, patternId);
+    if (!record) {
+      sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除');
+      return;
+    }
+    const style = store.taskMeta(record.taskId)?.style;
+    sendJson(res, 200, {
+      pattern: {
+        ...patternSummary(record),
+        style,
+        styleLabel: style ? STYLE_LABELS[style] : undefined,
+        candidate: record.candidate,
+      },
+    });
+  }
+
+  /** 选中其他候选后原地更新同一张图纸，不新增列表条目。 */
+  async function handleSavePattern(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const openId = requireOpenId(req, res, '请先登录再保存图纸');
+    if (!openId) return;
+
+    let body: { taskId?: unknown; candidateId?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as { taskId?: unknown; candidateId?: unknown };
+    } catch {
+      sendError(res, 400, 'invalid-pattern', '图纸参数不正确');
+      return;
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    if (!taskId || !candidateId) {
+      sendError(res, 400, 'invalid-pattern', '图纸参数不正确');
+      return;
+    }
+
+    const view = store.toView(taskId);
+    if (!view) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (view.status !== 'completed') {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再保存');
+      return;
+    }
+    // 匿名任务不落库：只有任务所有者本人才能保存。
+    const owner = store.ownerOf(taskId);
+    if (!owner || owner !== openId) {
+      sendError(res, 403, 'pattern-forbidden', '只能保存自己生成的图纸');
+      return;
+    }
+    const candidate = view.candidates?.find((item) => item.id === candidateId);
+    if (!candidate) {
+      sendError(res, 400, 'invalid-pattern', '没有找到这张候选图纸');
+      return;
+    }
+
+    const saved = savePattern(openId, taskId, candidate);
+    const record = patterns.get(openId, saved.id);
+    if (!record) {
+      sendError(res, 500, 'internal', '保存失败，请稍后重试');
+      return;
+    }
+    sendJson(res, 200, { pattern: patternSummary(record), evictedCount: saved.evictedCount });
+  }
+
+  function handleDeletePattern(req: IncomingMessage, res: ServerResponse, patternId: string): void {
+    const openId = requireOpenId(req, res, '请先登录再删除图纸');
+    if (!openId) return;
+    if (!patterns.remove(openId, patternId)) {
+      sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除');
+      return;
+    }
+    sendJson(res, 200, { ok: true });
+  }
+
+  /** 后台口令校验；不同后台只换提示文案与错误码。 */
+  function requireAdmin(
+    req: IncomingMessage,
+    res: ServerResponse,
+    labels = {
+      disabledCode: 'samples-disabled',
+      disabledMessage: '失败样本后台未启用',
+      forbiddenMessage: '无权查看失败样本',
+    },
+  ): boolean {
+    if (!options.adminToken) {
+      sendError(res, 404, labels.disabledCode, labels.disabledMessage);
+      return false;
+    }
+    if (String(req.headers['x-admin-token'] ?? '') !== options.adminToken) {
+      sendError(res, 403, 'admin-forbidden', labels.forbiddenMessage);
+      return false;
+    }
+    return true;
+  }
+
+  /** 三候选全不满意：把原图、参数与三候选一起留档，供后台回看。 */
+  async function handleReportFailureSample(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const taskId = String(req.headers['x-task-id'] ?? '');
+    if (!taskId) {
+      sendError(res, 400, 'invalid-sample', '缺少图纸信息，请重新生成后再反馈');
+      return;
+    }
+    const meta = store.taskMeta(taskId);
+    if (!meta) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (meta.status !== 'completed' || !meta.candidates?.length) {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再反馈');
+      return;
+    }
+    const openId = requestOpenId(req);
+    if (meta.openId && meta.openId !== openId) {
+      sendError(res, 403, 'sample-forbidden', '无权提交该图纸的反馈');
+      return;
+    }
+
+    let image: Buffer;
+    try {
+      image = await readBody(req);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        sendError(res, 413, 'image-too-large', '图片太大，请换一张小于 10MB 的图片');
+        return;
+      }
+      throw error;
+    }
+    if (image.length === 0) {
+      sendError(res, 400, 'empty-image', '没有收到图片，请重新上传');
+      return;
+    }
+
+    const sample = failureSamples.add({
+      taskId,
+      openId: meta.openId,
+      sizeTier: meta.sizeTier,
+      settings: meta.settings,
+      style: meta.style,
+      candidates: meta.candidates,
+      image,
+      imageContentType: String(req.headers['content-type'] ?? 'application/octet-stream'),
+    }, now().getTime());
+    logger.audit('failure_sample', {
+      sampleId: sample.id,
+      taskId,
+      openId: meta.openId,
+      at: new Date().toISOString(),
+    });
+    sendJson(res, 201, { sampleId: sample.id });
+  }
+
+  function handleListFailureSamples(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res)) return;
+    const rawLimit = Number(url.searchParams.get('limit') ?? '20');
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(1, Math.floor(rawLimit)), MAX_FAILURE_SAMPLES)
+      : 20;
+    sendJson(res, 200, {
+      samples: failureSamples.list(limit).map((sample) => ({
+        id: sample.id,
+        taskId: sample.taskId,
+        openId: sample.openId,
+        sizeTier: sample.sizeTier,
+        settings: sample.settings,
+        style: sample.style,
+        candidates: sample.candidates,
+        imageUrl: `/api/failure-samples/${sample.id}/image`,
+        createdAt: new Date(sample.createdAt).toISOString(),
+      })),
+    });
+  }
+
+  function handleFailureSampleImage(req: IncomingMessage, res: ServerResponse, sampleId: string): void {
+    if (!requireAdmin(req, res)) return;
+    const sample = failureSamples.get(sampleId);
+    if (!sample) {
+      sendError(res, 404, 'sample-not-found', '失败样本不存在');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': sample.imageContentType,
+      'content-length': String(sample.image.length),
+      'cache-control': 'no-store',
+    });
+    res.end(sample.image);
+  }
+
+  /** 失败样本按创建时间导出 CSV，供运营按验证期区间取数。 */
+  function handleExportFailureSamples(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res)) return;
+    const from = parseTimeBound(url.searchParams.get('from'));
+    const to = parseTimeBound(url.searchParams.get('to'));
+    if (!from.ok || !to.ok) {
+      sendError(res, 400, 'invalid-range', '时间范围格式不正确');
+      return;
+    }
+    const rows = failureSamples
+      .list(MAX_FAILURE_SAMPLES)
+      .filter((sample) => inTimeRange(sample.createdAt, { from: from.value, to: to.value }))
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((sample) =>
+        [
+          sample.id,
+          sample.taskId,
+          sample.openId ?? '',
+          sample.sizeTier,
+          JSON.stringify(sample.settings),
+          new Date(sample.createdAt).toISOString(),
+          `/api/failure-samples/${sample.id}/image`,
+          sample.style,
+        ]
+          .map(csvEscape)
+          .join(','),
+      );
+    const csv = [
+      'sampleId,taskId,openId,sizeTier,settings,createdAt,imageUrl,style',
+      ...rows,
+    ].join('\n');
+    const payload = `${csv}\n`;
+    res.writeHead(200, {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-length': String(Buffer.byteLength(payload)),
+      'content-disposition': 'attachment; filename="failure-samples.csv"',
+      'cache-control': 'no-store',
+    });
+    res.end(payload);
+  }
+
+  const dashboardLabels = {
+    disabledCode: 'metrics-disabled',
+    disabledMessage: '验证看板后台未启用',
+    forbiddenMessage: '无权查看验证看板',
+  };
+
+  /** 验证期四闸门的统一取数入口：时间区间 + 可选渠道。 */
+  function handleMetricsSummary(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    const from = parseTimeBound(url.searchParams.get('from'));
+    const to = parseTimeBound(url.searchParams.get('to'));
+    if (!from.ok || !to.ok) {
+      sendError(res, 400, 'invalid-range', '时间范围格式不正确');
+      return;
+    }
+    const channel = url.searchParams.get('channel') || undefined;
+    sendJson(res, 200, metrics.summary({ from: from.value, to: to.value, channel }));
+  }
+
+  async function handleRecordBlindTest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    let body: {
+      testerId?: unknown;
+      group?: unknown;
+      competitor?: unknown;
+      winner?: unknown;
+    };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as typeof body;
+    } catch {
+      sendError(res, 400, 'invalid-blind-test', '盲测记录格式不正确');
+      return;
+    }
+    const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+    const testerId = text(body.testerId);
+    const group = text(body.group);
+    const competitor = text(body.competitor);
+    const winner = text(body.winner);
+    if (
+      !testerId ||
+      testerId.length > 64 ||
+      !group ||
+      group.length > 32 ||
+      !competitor ||
+      competitor.length > 32 ||
+      !BLIND_TEST_WINNERS.includes(winner as BlindTestWinner)
+    ) {
+      sendError(res, 400, 'invalid-blind-test', '盲测记录格式不正确');
+      return;
+    }
+    metrics.recordBlindTest(
+      { testerId, group, competitor, winner: winner as BlindTestWinner },
+      now().getTime(),
+    );
+    sendJson(res, 201, { ok: true });
+  }
+
+  function handleListBlindTests(req: IncomingMessage, res: ServerResponse): void {
+    if (!requireAdmin(req, res, dashboardLabels)) return;
+    sendJson(res, 200, metrics.blindTestSummary());
+  }
+
+  /** 分享记录只公开这一张候选快照，不带任务号、账号或其他图纸。 */
+  function shareView(record: ShareRecord): Record<string, unknown> {
+    return {
+      shareId: record.id,
+      candidate: record.candidate,
+      coverUrl: `/api/shares/${record.id}/cover`,
+      createdAt: new Date(record.createdAt).toISOString(),
+    };
+  }
+
+  /** 生成分享链接：复制当前候选快照，接收者无需登录即可查看。 */
+  async function handleCreateShare(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: { taskId?: unknown; candidateId?: unknown; source?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as {
+        taskId?: unknown;
+        candidateId?: unknown;
+        source?: unknown;
+      };
+    } catch {
+      sendError(res, 400, 'invalid-share', '分享参数不正确');
+      return;
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    const source = typeof body.source === 'string' ? body.source : 'menu';
+    if (!taskId || !candidateId || !SHARE_SOURCES.includes(source as ShareSource)) {
+      sendError(res, 400, 'invalid-share', '分享参数不正确');
+      return;
+    }
+
+    const meta = store.taskMeta(taskId);
+    if (!meta) {
+      sendError(res, 404, 'task-not-found', '图纸不存在，请重新生成');
+      return;
+    }
+    if (meta.status !== 'completed' || !meta.candidates?.length) {
+      sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再分享');
+      return;
+    }
+    const openId = requestOpenId(req);
+    if (meta.openId && meta.openId !== openId) {
+      sendError(res, 403, 'share-forbidden', '只能分享自己生成的图纸');
+      return;
+    }
+    const candidate = meta.candidates.find((item) => item.id === candidateId);
+    if (!candidate) {
+      sendError(res, 400, 'invalid-share', '没有找到这张候选图纸');
+      return;
+    }
+
+    const record = shares.create({
+      taskId,
+      candidateId: candidate.id,
+      source: source as ShareSource,
+      candidate,
+      openId: meta.openId,
+    });
+    logger.audit('share_created', {
+      shareId: record.id,
+      taskId,
+      candidateId: candidate.id,
+      source,
+      openId: meta.openId,
+      at: new Date(record.createdAt).toISOString(),
+    });
+    sendJson(res, 201, { shareId: record.id, coverUrl: `/api/shares/${record.id}/cover` });
+  }
+
+  /** 公开查看：只按分享号取快照，无法枚举或越权打开其他图纸。 */
+  function handleGetShare(req: IncomingMessage, res: ServerResponse, shareId: string): void {
+    const record = shares.openAndCount(shareId);
+    if (!record) {
+      sendError(res, 404, 'share-not-found', '分享已失效');
+      return;
+    }
+    sendJson(res, 200, shareView(record));
+  }
+
+  async function handleShareCover(req: IncomingMessage, res: ServerResponse, shareId: string): Promise<void> {
+    const record = shares.get(shareId);
+    if (!record) {
+      sendError(res, 404, 'share-not-found', '分享已失效');
+      return;
+    }
+    const cover = await renderShareCover(record.candidate);
+    res.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': String(cover.length),
+      'cache-control': 'public, max-age=86400',
+    });
+    res.end(cover);
+  }
+
+  /** 后台统计分享次数、来源与打开次数。 */
+  function handleListShares(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (
+      !requireAdmin(req, res, {
+        disabledCode: 'shares-disabled',
+        disabledMessage: '分享后台未启用',
+        forbiddenMessage: '无权查看分享统计',
+      })
+    ) {
+      return;
+    }
+    const rawLimit = Number(url.searchParams.get('limit') ?? '20');
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(1, Math.floor(rawLimit)), MAX_SHARES)
+      : 20;
+    sendJson(res, 200, {
+      total: shares.total,
+      shares: shares.list(limit).map((record) => ({
+        shareId: record.id,
+        taskId: record.taskId,
+        candidateId: record.candidateId,
+        source: record.source,
+        openCount: record.openCount,
+        createdAt: new Date(record.createdAt).toISOString(),
+      })),
+    });
+  }
+
+  async function handleCreateExport(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const openId = requireOpenId(req, res, '请先登录再导出高清图纸');
+    if (!openId) return;
+
+    let body: { taskId?: unknown; candidateId?: unknown; patternId?: unknown; type?: unknown };
+    try {
+      const raw = await readBody(req, 4096);
+      body = JSON.parse(raw.toString('utf8') || '{}') as {
+        taskId?: unknown;
+        candidateId?: unknown;
+        patternId?: unknown;
+        type?: unknown;
+      };
+    } catch {
+      sendError(res, 400, 'invalid-export', '导出参数不正确');
+      return;
+    }
+    let taskId = typeof body.taskId === 'string' ? body.taskId : '';
+    let candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
+    const patternId = typeof body.patternId === 'string' ? body.patternId : '';
+    const format: ExportFormat | undefined =
+      body.type === undefined || body.type === 'hd'
+        ? 'hd'
+        : body.type === 'tiled'
+          ? 'tiled'
+          : undefined;
+    if (!format) {
+      sendError(res, 400, 'invalid-export', '导出参数不正确');
+      return;
+    }
+
+    let candidate: Candidate;
+    if (patternId) {
+      // 从「我的图纸」重开时用保存的快照，任务表淘汰后仍可导出，缓存键不变。
+      const record = patterns.get(openId, patternId);
+      if (!record) {
+        sendError(res, 404, 'pattern-not-found', '图纸不存在或已删除，请重新生成');
+        return;
+      }
+      taskId = record.taskId;
+      candidateId = record.candidate.id;
+      candidate = record.candidate;
+    } else {
+      if (!taskId || !candidateId) {
+        sendError(res, 400, 'invalid-export', '导出参数不正确');
+        return;
+      }
+      const view = store.toView(taskId);
+      if (!view) {
+        sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
+        return;
+      }
+      if (view.status !== 'completed') {
+        sendError(res, 409, 'task-not-ready', '图纸还在生成，请稍后再导出');
+        return;
+      }
+      const found = view.candidates?.find((item) => item.id === candidateId);
+      if (!found) {
+        sendError(res, 400, 'invalid-export', '没有找到这张候选图纸');
+        return;
+      }
+      candidate = found;
+      const owner = store.ownerOf(taskId);
+      if (owner && owner !== openId) {
+        sendError(res, 403, 'export-forbidden', '无权导出该图纸');
+        return;
+      }
+    }
+
+    const key = exportKey(openId, taskId, candidateId, format);
+    const inFlight = pendingExports.get(key);
+    if (inFlight) {
+      sendExportResult(res, await inFlight);
+      return;
+    }
+
+    const decision = exportStore.decide(key);
+
+    let record: ExportRecord;
+    if (decision.outcome === 'cached') {
+      record = decision.record;
+    } else {
+      const creation = createExportRecord(key, openId, { taskId, candidateId, candidate, format });
+      pendingExports.set(key, creation);
+      try {
+        record = await creation;
+      } finally {
+        pendingExports.delete(key);
+      }
+    }
+
+    logger.audit(decision.outcome === 'cached' ? 'export_cache_hit' : 'export_created', {
+      exportId: record.id,
+      taskId,
+      candidateId,
+      openId,
+      width: record.width,
+      height: record.height,
+      at: new Date().toISOString(),
+    });
+    sendExportResult(res, record);
+  }
+
+  function sendExportResult(res: ServerResponse, record: ExportRecord): void {
+    const suffix = record.format === 'tiled' ? 'pdf' : 'png';
+    sendJson(res, 200, {
+      exportId: record.id,
+      url: `/api/exports/${record.id}.${suffix}`,
+      taskId: record.taskId,
+      candidateId: record.candidateId,
+      type: record.format,
+      format: suffix,
+      pageCount: record.pageCount,
+      width: record.width,
+      height: record.height,
+      quota: UNLIMITED_EXPORT_QUOTA,
+    });
+  }
+
+  async function createExportRecord(
+    key: string,
+    openId: string,
+    input: { taskId: string; candidateId: string; candidate: Candidate; format: ExportFormat },
+  ): Promise<ExportRecord> {
+    if (input.format === 'tiled') {
+      const { pdf, pageCount } = await renderTiledPrintExport(input.candidate);
+      return exportStore.save(key, {
+        taskId: input.taskId,
+        candidateId: input.candidateId,
+        openId,
+        format: 'tiled',
+        pageCount,
+        width: input.candidate.width,
+        height: input.candidate.height,
+        buffer: pdf,
+      });
+    }
+    const buffer = await renderHdExport(input.candidate);
+    return exportStore.save(key, {
+      taskId: input.taskId,
+      candidateId: input.candidateId,
+      openId,
+      format: 'hd',
+      width: input.candidate.width,
+      height: input.candidate.height,
+      buffer,
+    });
+  }
+
+  function handleDownloadExport(
+    req: IncomingMessage,
+    res: ServerResponse,
+    exportId: string,
+    suffix: string,
+  ): void {
+    const token = String(req.headers['x-session-token'] ?? '');
+    const openId = token ? session.openIdFor(token) : undefined;
+    if (!openId) {
+      sendError(res, 401, 'login-required', '请先登录再下载图纸');
+      return;
+    }
+    const record = exportStore.get(exportId);
+    if (!record || record.format !== (suffix === 'pdf' ? 'tiled' : 'hd')) {
+      sendError(res, 404, 'export-not-found', '导出资源不存在，请重新导出');
+      return;
+    }
+    if (record.openId !== openId) {
+      sendError(res, 403, 'export-forbidden', '无权下载该图纸');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': record.format === 'tiled' ? 'application/pdf' : 'image/png',
+      'content-length': record.buffer.length,
+      'cache-control': 'no-store',
+    });
+    res.end(record.buffer);
+  }
+
+  return createHttpServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+
+    try {
+      if (req.method === 'GET' && url.pathname === '/healthz') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/session') {
+        await handleSession(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/generate') {
+        await handleGenerate(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/events') {
+        await handleEvent(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/metrics/summary') {
+        handleMetricsSummary(req, res, url);
+        return;
+      }
+
+      if (url.pathname === '/api/metrics/blind-tests') {
+        if (req.method === 'GET') {
+          handleListBlindTests(req, res);
+          return;
+        }
+        if (req.method === 'POST') {
+          await handleRecordBlindTest(req, res);
+          return;
+        }
+      }
+
+      if (url.pathname === '/api/patterns') {
+        if (req.method === 'GET') {
+          handleListPatterns(req, res);
+          return;
+        }
+        if (req.method === 'POST') {
+          await handleSavePattern(req, res);
+          return;
+        }
+      }
+
+      const patternMatch = url.pathname.match(/^\/api\/patterns\/([^/]+)$/);
+      if (patternMatch) {
+        const patternId = decodeURIComponent(patternMatch[1]);
+        if (req.method === 'GET') {
+          handleGetPattern(req, res, patternId);
+          return;
+        }
+        if (req.method === 'DELETE') {
+          handleDeletePattern(req, res, patternId);
+          return;
+        }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/failure-samples/export') {
+        handleExportFailureSamples(req, res, url);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/failure-samples') {
+        await handleReportFailureSample(req, res);
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/failure-samples') {
+        handleListFailureSamples(req, res, url);
+        return;
+      }
+
+      const sampleImageMatch = url.pathname.match(/^\/api\/failure-samples\/([^/]+)\/image$/);
+      if (req.method === 'GET' && sampleImageMatch) {
+        handleFailureSampleImage(req, res, decodeURIComponent(sampleImageMatch[1]));
+        return;
+      }
+
+      if (url.pathname === '/api/shares') {
+        if (req.method === 'POST') {
+          await handleCreateShare(req, res);
+          return;
+        }
+        if (req.method === 'GET') {
+          handleListShares(req, res, url);
+          return;
+        }
+      }
+
+      const shareCoverMatch = url.pathname.match(/^\/api\/shares\/([^/]+)\/cover$/);
+      if (req.method === 'GET' && shareCoverMatch) {
+        await handleShareCover(req, res, decodeURIComponent(shareCoverMatch[1]));
+        return;
+      }
+
+      const shareMatch = url.pathname.match(/^\/api\/shares\/([^/]+)$/);
+      if (req.method === 'GET' && shareMatch) {
+        handleGetShare(req, res, decodeURIComponent(shareMatch[1]));
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/exports') {
+        await handleCreateExport(req, res);
+        return;
+      }
+
+      const exportMatch = url.pathname.match(/^\/api\/exports\/([^/]+)\.(png|pdf)$/);
+      if (req.method === 'GET' && exportMatch) {
+        handleDownloadExport(req, res, exportMatch[1], exportMatch[2]);
+        return;
+      }
+
+      const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+      if (req.method === 'GET' && taskMatch) {
+        const view = store.toView(decodeURIComponent(taskMatch[1]));
+        if (!view) {
+          sendError(res, 404, 'task-not-found', '任务不存在，请重新生成');
+          return;
+        }
+        sendJson(res, 200, view);
+        return;
+      }
+
+      sendError(res, 404, 'not-found', '接口不存在');
+    } catch (error) {
+      logger.warn('request_failed', {
+        path: url.pathname,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (!res.headersSent) sendError(res, 500, 'internal', '服务异常，请稍后重试');
+    }
+  });
+}

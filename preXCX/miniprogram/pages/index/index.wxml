@@ -1,0 +1,248 @@
+<view class="page">
+  <view class="header">
+    <view class="header-top">
+      <text class="title">上传一张图，直接出图纸</text>
+      <text class="header-link" bindtap="openPatterns">我的图纸 ›</text>
+    </view>
+    <text class="subtitle">自动抠主体 · 自动配色 · MARD 221 色卡</text>
+  </view>
+
+  <view wx:if="{{stage === 'idle' || (stage === 'preview' && hasImage)}}" class="advanced">
+    <view class="advanced-toggle" bindtap="toggleAdvanced">
+      <text class="advanced-title">高级设置</text>
+      <text class="advanced-action">{{advancedOpen ? '收起' : '展开'}}</text>
+    </view>
+
+    <block wx:if="{{advancedOpen}}">
+      <view class="option-block">
+        <text class="option-title">抖动</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{ditheringOptions}}"
+            wx:key="id"
+            class="chip {{advanced.dithering === item.id ? 'active' : ''}}"
+            data-field="dithering"
+            data-value="{{item.id}}"
+            bindtap="selectAdvancedOption"
+          >{{item.label}}</view>
+        </view>
+      </view>
+
+      <view class="option-block">
+        <text class="option-title">背景处理</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{backgroundOptions}}"
+            wx:key="id"
+            class="chip {{advanced.background === item.id ? 'active' : ''}}"
+            data-field="background"
+            data-value="{{item.id}}"
+            bindtap="selectAdvancedOption"
+          >{{item.label}}</view>
+        </view>
+      </view>
+
+      <view class="option-block">
+        <text class="option-title">色号上限</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{maxColorsOptions}}"
+            wx:key="id"
+            class="chip {{maxColorsId === item.id ? 'active' : ''}}"
+            data-field="maxColors"
+            data-value="{{item.id}}"
+            bindtap="selectAdvancedOption"
+          >{{item.label}}</view>
+        </view>
+        <text class="notice">这是整体上限，各候选仍按自己的策略封顶</text>
+      </view>
+
+      <view class="option-block">
+        <text class="option-title">降采样模式</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{downscaleOptions}}"
+            wx:key="id"
+            class="chip {{advanced.downscale === item.id ? 'active' : ''}}"
+            data-field="downscale"
+            data-value="{{item.id}}"
+            bindtap="selectAdvancedOption"
+          >{{item.label}}</view>
+        </view>
+      </view>
+
+      <view class="option-block">
+        <text class="option-title">系列色</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{seriesOptions}}"
+            wx:key="key"
+            class="chip {{item.active ? 'active' : ''}}"
+            data-code="{{item.code}}"
+            bindtap="toggleSeries"
+          >{{item.label}}</view>
+        </view>
+        <text class="notice">「全部」表示不限制系列；选中多个系列时只在这些系列里配色</text>
+      </view>
+
+      <text wx:if="{{advancedDirty && stage === 'preview'}}" class="notice notice-advanced">高级设置已修改，重新生成后生效</text>
+      <text wx:elif="{{advancedDirty}}" class="notice notice-advanced">高级设置已修改，将在生成时生效</text>
+      <button
+        wx:if="{{advancedDirty && stage === 'preview'}}"
+        class="btn regenerate"
+        bindtap="regenerate"
+      >按当前设置重新生成</button>
+    </block>
+  </view>
+
+  <block wx:if="{{stage === 'idle'}}">
+    <view class="option-block">
+      <text class="option-title">成品尺寸档</text>
+      <view class="chips">
+        <view
+          wx:for="{{sizeOptions}}"
+          wx:key="id"
+          class="chip {{sizeTier === item.id ? 'active' : ''}}"
+          data-id="{{item.id}}"
+          bindtap="selectSize"
+        >{{item.label}}</view>
+      </view>
+    </view>
+
+    <view wx:if="{{styleGroups.length}}" class="option-block">
+      <text class="option-title">风格族</text>
+      <view wx:for="{{styleGroups}}" wx:for-item="group" wx:key="group" class="style-group">
+        <text class="group-title">{{group.label}}</text>
+        <view class="chips wrap">
+          <view
+            wx:for="{{group.options}}"
+            wx:key="id"
+            class="chip {{style === item.id ? 'active' : ''}}"
+            data-id="{{item.id}}"
+            bindtap="selectStyle"
+          >{{item.label}}</view>
+        </view>
+      </view>
+      <text class="notice">风格转换在生成图纸前完成</text>
+    </view>
+
+    <view class="dropzone" bindtap="chooseImage">
+      <text class="drop-title">选择一张图片</text>
+      <text class="drop-hint">JPG / PNG，不超过 10MB</text>
+    </view>
+  </block>
+
+  <block wx:elif="{{stage === 'uploading' || stage === 'processing'}}">
+    <view class="state">
+      <text class="state-title">{{stage === 'uploading' ? '正在上传…' : '正在生成图纸…'}}</text>
+      <text class="state-hint">{{statusText}}</text>
+    </view>
+  </block>
+
+  <block wx:elif="{{stage === 'error'}}">
+    <view class="state">
+      <text class="state-title">{{message}}</text>
+      <button wx:if="{{canRetry}}" class="btn primary" bindtap="retry">重试</button>
+      <button wx:if="{{canSkipStyle}}" class="btn" bindtap="skipStyle">跳过风格，按原图生成</button>
+      <button class="btn" bindtap="chooseImage">换一张图</button>
+    </view>
+  </block>
+
+  <block wx:elif="{{stage === 'preview'}}">
+    <view class="pick-hint">{{previewHint}}</view>
+    <text wx:if="{{appliedSettings}}" class="notice applied">{{appliedSettings}}</text>
+    <text wx:if="{{styleLabel}}" class="notice">风格：{{styleLabel}}</text>
+
+    <view class="candidate-list">
+      <view
+        wx:for="{{candidates}}"
+        wx:key="id"
+        class="candidate-card {{index === selectedIndex ? 'selected' : ''}}"
+        data-index="{{index}}"
+        bindtap="selectCandidate"
+      >
+        <canvas
+          type="2d"
+          id="thumb-{{index}}"
+          class="thumb-canvas"
+          style="width: {{thumbSize}}px; height: {{thumbSize}}px;"
+          data-index="{{index}}"
+          bindtap="selectCandidate"
+        ></canvas>
+        <view class="candidate-info">
+          <text class="candidate-label">{{item.label}}</text>
+          <text class="candidate-meta">{{item.colors.length}} 个色号 · {{item.boardCount}} 块板</text>
+        </view>
+        <text class="candidate-state">{{index === selectedIndex ? '已选' : '查看'}}</text>
+      </view>
+    </view>
+
+    <text class="notice">屏幕颜色与拼豆实物存在轻微色差，以实物为准</text>
+
+    <block wx:if="{{candidate}}">
+      <view class="summary">
+        <text class="summary-main">{{candidate.width}} × {{candidate.height}} · {{candidate.label}}</text>
+        <text class="summary-sub">MARD 221 · {{candidate.colors.length}} 个色号 · {{candidate.boardCount}} 块板 · 合计 {{candidate.width * candidate.height}} 颗</text>
+      </view>
+
+      <scroll-view class="canvas-scroll" scroll-x scroll-y>
+        <canvas
+          type="2d"
+          id="pattern"
+          class="pattern-canvas"
+          style="width: {{canvasSize}}px; height: {{canvasSize}}px;"
+        ></canvas>
+      </scroll-view>
+
+      <view wx:if="{{candidate && candidate.materials.length}}" class="materials">
+        <view class="materials-head">
+          <view class="materials-title-wrap">
+            <text class="materials-title">材料包清单</text>
+            <text class="materials-sub">共 {{materialPackCount}} 包 · 每包 1000 颗</text>
+          </view>
+          <view class="materials-buy" bindtap="goPurchase">去购买</view>
+        </view>
+        <scroll-view class="materials-list" scroll-y style="height: {{materialListHeight}}rpx;">
+          <view wx:for="{{candidate.materials}}" wx:key="code" class="material-row">
+            <view class="material-dot" style="background: {{item.hex}};"></view>
+            <text class="material-code">{{item.code}}</text>
+            <text class="material-name">{{item.name}}</text>
+            <text class="material-count">{{item.count}} 颗</text>
+            <text class="material-packs">{{item.packages}} 包</text>
+          </view>
+        </scroll-view>
+      </view>
+
+      <button
+        class="btn primary export-btn"
+        loading="{{exporting && exportingType === 'hd'}}"
+        disabled="{{exporting}}"
+        bindtap="exportCurrent"
+      >导出高清图纸</button>
+      <text class="notice">高清整图含格线与色号，保存到相册后可直接打印</text>
+
+      <button
+        class="btn export-btn"
+        loading="{{exporting && exportingType === 'tiled'}}"
+        disabled="{{exporting}}"
+        bindtap="exportTiled"
+      >导出 A4 分块打印图（{{candidate.boardCount}} 页）</button>
+      <text class="notice">按 29 格一块板分页，每页带页码、拼板编号与对齐坐标，打印后可直接照着拼</text>
+    </block>
+
+    <view class="actions">
+      <button wx:if="{{candidate}}" class="btn" open-type="share">分享给好友</button>
+      <button class="btn" bindtap="chooseImage">换一张图</button>
+      <view wx:if="{{hasImage}}" class="escape-link" bindtap="openDissatisfied">三张都不满意？</view>
+    </view>
+  </block>
+
+  <block wx:elif="{{stage === 'dissatisfied'}}">
+    <view class="state">
+      <text class="state-title">三张都不满意？</text>
+      <text class="state-hint">{{sampleReporting ? '正在记录这次反馈…' : sampleReported ? '原图和当前参数已记录，我们会据此改进' : '反馈暂未记录，换图或裁剪后仍会按当前参数重新生成'}}</text>
+      <button class="btn primary escape-btn" bindtap="chooseImage">换张图</button>
+      <button class="btn escape-btn" bindtap="cropSubject">裁主体</button>
+    </view>
+  </block>
+</view>

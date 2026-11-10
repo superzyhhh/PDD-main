@@ -1,0 +1,4 @@
+{
+  "desc": "拼豆图纸生成小程序",
+  "rules": [{ "action": "allow", "page": "*" }]
+}
